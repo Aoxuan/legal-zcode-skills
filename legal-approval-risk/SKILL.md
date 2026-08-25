@@ -35,8 +35,9 @@ description: 定时扫描飞书里待审批(PENDING)的合同审批,读取表单
 - `approval:approval.list:readonly`(查询实例列表)
 - `approval:approval:readonly`(实例详情)
 - `approval:approval`(创建评论,含写)
+- `contact:user.id:readonly`(手机号/邮箱反查 open_id,用于指定评论发表人)
 
-本技能**不需要**机器人、消息事件、webhook。部分租户写评论还要求指定发表人,此时向用户索取 `FEISHU_COMMENT_USER_ID`(及可选的 `FEISHU_COMMENT_USER_ID_TYPE`,默认 `open_id`)。
+本技能**不需要**机器人、消息事件、webhook。租户写评论必须带 `FEISHU_COMMENT_USER_ID`(及可选的 `FEISHU_COMMENT_USER_ID_TYPE`,默认 `open_id`)。没有现成 `open_id` 时,向用户要**手机号或个人邮箱**(不要企业邮箱);`FEISHU_APP_ID` / `FEISHU_APP_SECRET` 已写入 `.env` 后,用 `tenant_access_token` 调 `POST /open-apis/contact/v3/users/batch_get_id?user_id_type=open_id`,把返回的 `open_id` 写入技能根目录 `.env` 的 `FEISHU_COMMENT_USER_ID`。不要把手机号/邮箱写入对话以外的文件,不要提交 `.env`。查不到则提示检查 `contact:user.id:readonly` 已发版,且该账号在应用通讯录权限范围内。
 
 ## 工作流程
 
