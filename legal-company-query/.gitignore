@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+
+data/
+snapshots/
+reports/
+audit.jsonl
+*.xlsx
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+

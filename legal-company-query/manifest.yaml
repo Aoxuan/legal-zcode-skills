@@ -1,0 +1,81 @@
+# 技能清单(平台无关事实源)
+# 安装与配置在 zcode / Cursor / Hermes 三端完全一致,无平台专属步骤。
+
+name: legal-company-query
+version: "1.0.0"
+title: 企业风险查询(企查查风险调查)
+status: ga
+rules_version: legal-draft-2026-08-13
+
+# 入口契约:四个子命令,全部 stdout UTF-8 JSON
+entry:
+  script: scripts/query.py
+  commands:
+    check:
+      args: []
+      desc: 体检企查查凭据 + 远程 MySQL 连通;缺任一即失败
+    search:
+      args: [keyword]
+      desc: 886 模糊匹配,返回候选列表(约 0.10 元)
+    profile:
+      args: [name, credit_code, legal_person]
+      desc: 取详情+风险,落本地快照 + 必写 MySQL + 出 Excel(约 7.50 元)
+    export:
+      args: [name]
+      desc: 从已落盘快照脱机重生成 Excel,零成本
+
+inputs:
+  - name: keyword
+    type: string
+    required: true
+    for: search
+    desc: 企业名称(可不精准),用于 886 模糊匹配
+  - name: name
+    type: string
+    required: true
+    for: profile
+    desc: 工商全称(与 search 候选一致)
+  - name: credit_code
+    type: string
+    required: false
+    for: profile
+    desc: 统一社会信用代码;无则传空串
+  - name: legal_person
+    type: string
+    required: false
+    for: profile
+    desc: 法定代表人;无则传空串
+
+outputs:
+  ok: bool
+  error: string
+  profile:
+    name: string
+    credit_code: string
+    legal_person: string
+    status: string
+    three_element_ok: bool|null
+    risk_level: enum[low, medium, high, unknown]
+    hits: list
+    snapshot_files: list
+    report_file: string
+    cost: float
+    called_apis: list[int]
+  candidates: list
+  report_file: string
+
+depends:
+  - 企查查主账号(QCC_APP_KEY / QCC_SECRET_KEY):856/739;缺 Monica 时回退用于 886/2006/887/888/889
+  - 企查查 Monica 账号(QCC_APP_KEY_MONICA / QCC_SECRET_KEY_MONICA):固定用于 886/2006/887/888/889;两套都填,只填一套会查不全
+  - 远程 MySQL(MYSQL_HOST / MYSQL_PORT / MYSQL_USER / MYSQL_PASSWORD / MYSQL_DB):必写 legal_company_query
+
+reuse:
+  - scripts/qcc/  # 发行副本;开发源为 01-poc/qcc/
+  - scripts/common/  # 发行副本;开发源为 01-poc/common/
+
+# 三端安装配置完全一致,无平台专属步骤
+packaging: |
+  运行时要求本机 Python 3.11,Windows 与 macOS 均可(见 INSTALL.md)。
+  安装 = 把本文件夹放入平台 skills 目录(zcode / Cursor / Hermes 相同),
+  pip install -r requirements.txt(Windows: py; macOS: python3),复制 .env.example 为 .env 填值即可。
+  本技能是一次性只读查询,无长流程/回调/跨天状态机。

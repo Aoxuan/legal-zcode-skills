@@ -1,0 +1,69 @@
+# 技能清单(平台无关事实源)
+# 安装与配置在 zcode / Cursor / Hermes 三端完全一致,无平台专属步骤。
+
+name: legal-approval-risk
+version: "1.0.0"
+title: 合同审批风险预警(待审批合同评论区风险+Excel)
+status: ga
+rules_version: legal-draft-2026-08-13
+
+# 入口契约:三个子命令,全部 stdout UTF-8 JSON
+entry:
+  script: scripts/poll.py
+  commands:
+    check:
+      args: []
+      desc: 体检飞书 app 凭证 + 审批定义 + 企查查 + 远程 MySQL
+    poll:
+      args: []
+      desc: 扫描 PENDING 合同审批,取风险,评论回实例(幂等,缓存未命中约 7.50 元/家)
+    test-instance:
+      args: [instance_code]
+      desc: 干跑单实例,解析三要素+取风险,不写评论
+
+inputs:
+  - name: instance_code
+    type: string
+    required: true
+    for: test-instance
+    desc: 飞书审批实例 instance_code
+
+outputs:
+  ok: bool
+  error: string
+  scanned: int
+  new: int
+  processed: list
+  skipped: list
+  errors: list
+  profile:
+    name: string
+    credit_code: string
+    legal_person: string
+    status: string
+    three_element_ok: bool|null
+    risk_level: enum[low, medium, high, unknown]
+    hits: list
+    cost: float
+    source: string
+
+depends:
+  - 飞书自建应用(FEISHU_APP_ID / FEISHU_APP_SECRET):tenant_access_token;需审批读+评论权限
+  - 合同审批定义(FEISHU_APPROVAL_CODES):一个或多个 approval_code
+  - 表单字段映射(FEISHU_FIELD_COMPANY_NAME / FEISHU_FIELD_CREDIT_CODE / FEISHU_FIELD_LEGAL_PERSON)
+  - 企查查主账号(QCC_APP_KEY / QCC_SECRET_KEY):856/739;缺 Monica 时回退用于 886/2006/887/888/889
+  - 企查查 Monica 账号(QCC_APP_KEY_MONICA / QCC_SECRET_KEY_MONICA):固定用于 886/2006/887/888/889;两套都填,只填一套会查不全
+  - 远程 MySQL(MYSQL_HOST / MYSQL_PORT / MYSQL_USER / MYSQL_PASSWORD / MYSQL_DB):必写 legal_company_query
+
+reuse:
+  - scripts/qcc/  # 发行副本;开发源为 01-poc/qcc/
+  - scripts/common/  # 发行副本;开发源为 01-poc/common/
+  - scripts/feishu/  # 发行副本;开发源为 01-poc/feishu/client.py,本技能新增审批查询/详情/评论
+
+# 三端安装配置完全一致;定时由宿主 loop/任务计划触发,技能本身是无状态的一趟扫描
+packaging: |
+  运行时要求本机 Python 3.11,Windows 与 macOS 均可(见 INSTALL.md)。
+  安装 = 把本文件夹放入平台 skills 目录(zcode / Cursor / Hermes 相同),
+  pip install -r requirements.txt(Windows: py; macOS: python3),复制 .env.example 为 .env 填值即可。
+  飞书凭证由每个安装者提供并写入自己的 .env,不要入库。
+  长流程用宿主定时调用 poll,技能内用 data/state.json 做实例级幂等。

@@ -1,0 +1,6 @@
+# legal-company-query runtime deps (Python 3.11)
+# install: py -m pip install -r requirements.txt
+requests>=2.31.0
+python-dotenv>=1.0.0
+openpyxl>=3.1.0
+pymysql>=1.1.0
