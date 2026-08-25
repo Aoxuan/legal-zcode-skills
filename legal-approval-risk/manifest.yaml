@@ -50,7 +50,7 @@ outputs:
 depends:
   - 飞书自建应用(FEISHU_APP_ID / FEISHU_APP_SECRET):tenant_access_token;需审批读+评论权限
   - 合同审批定义(FEISHU_APPROVAL_CODES):一个或多个 approval_code
-  - 表单字段映射(FEISHU_FIELD_COMPANY_NAME / FEISHU_FIELD_CREDIT_CODE / FEISHU_FIELD_LEGAL_PERSON)
+  - 表单对方企业控件(FEISHU_FIELD_COMPANY,当前「对方单位名称」;三要素从该外部选项取出)
   - 企查查主账号(QCC_APP_KEY / QCC_SECRET_KEY):856/739;缺 Monica 时回退用于 886/2006/887/888/889
   - 企查查 Monica 账号(QCC_APP_KEY_MONICA / QCC_SECRET_KEY_MONICA):固定用于 886/2006/887/888/889;两套都填,只填一套会查不全
   - 远程 MySQL(MYSQL_HOST / MYSQL_PORT / MYSQL_USER / MYSQL_PASSWORD / MYSQL_DB):必写 legal_company_query

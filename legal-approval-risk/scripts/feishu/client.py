@@ -89,46 +89,37 @@ def _split_combo(text):
     return out
 
 
-def extract_company_fields(form_items, name_key, credit_key, legal_key):
-    """从表单控件按 .env 标识取企业三要素。标识可对 id / custom_id / name。
+def extract_company_fields(form_items, company_key):
+    """从「对方企业」那一个控件取三要素。标识可对 id / custom_id / name。
 
-    支持 radioV2 外部选项: option.key=信用代码, value/text=名称｜代码｜法人。
-    返回 {name, credit_code, legal_person, missing}。缺字段列入 missing,不猜测。
+    当前表单是 radioV2 外部选项: option.key=信用代码, value/text=名称｜代码｜法人。
+    不读「对方负责人」(联系人)。法人缺了由企查查 2006 回填,不算表单缺字段。
+    返回 {name, credit_code, legal_person, missing}。missing 只含 name / credit_code。
     """
-    wanted = {
-        "name": (name_key or "").strip(),
-        "credit_code": (credit_key or "").strip(),
-        "legal_person": (legal_key or "").strip(),
-    }
+    needle = (company_key or "").strip()
     found = {"name": "", "credit_code": "", "legal_person": ""}
+    if not needle:
+        found["missing"] = ["name", "credit_code"]
+        return found
     for item in form_items or []:
         if not isinstance(item, dict):
             continue
         keys = _item_keys(item)
+        if needle not in keys:
+            continue
         option = item.get("option") if isinstance(item.get("option"), dict) else {}
         raw_val = _normalize_value(item.get("value"))
         combo = _split_combo(raw_val) or _split_combo(_normalize_value(option.get("text")))
-        for field, needle in wanted.items():
-            if not needle or needle not in keys or found[field]:
-                continue
-            if field == "credit_code" and option.get("key"):
-                found[field] = str(option.get("key") or "").strip()
-            elif combo and combo.get(field):
-                found[field] = combo[field]
-            else:
-                found[field] = raw_val
         if combo:
-            for field in ("name", "credit_code", "legal_person"):
-                if not found[field] and combo.get(field) and wanted[field] in keys:
-                    found[field] = combo[field]
-            # 三要素都挤在同一控件时,一次命中补齐空字段
-            if any(wanted[f] in keys for f in wanted):
-                for field in ("name", "credit_code", "legal_person"):
-                    if not found[field] and combo.get(field):
-                        found[field] = combo[field]
-        if option.get("key") and not found["credit_code"] and any(wanted[f] in keys for f in wanted):
+            found["name"] = combo.get("name") or ""
+            found["credit_code"] = combo.get("credit_code") or ""
+            found["legal_person"] = combo.get("legal_person") or ""
+        if option.get("key") and not found["credit_code"]:
             found["credit_code"] = str(option.get("key") or "").strip()
-    missing = [k for k, v in found.items() if not v]
+        if not found["name"]:
+            found["name"] = raw_val
+        break
+    missing = [k for k in ("name", "credit_code") if not found[k]]
     found["missing"] = missing
     return found
 

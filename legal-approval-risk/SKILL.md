@@ -20,7 +20,7 @@ description: 定时扫描飞书里待审批(PENDING)的合同审批,读取表单
 3. 复制 `.env.example` 为 `.env`。**向用户索取**并写入下列凭据,缺则不要硬跑:
    - 飞书自建应用 `FEISHU_APP_ID` / `FEISHU_APP_SECRET`
    - 合同审批定义 `FEISHU_APPROVAL_CODES`(多个用逗号分隔)
-   - 表单企业三要素控件标识 `FEISHU_FIELD_COMPANY_NAME` / `FEISHU_FIELD_CREDIT_CODE` / `FEISHU_FIELD_LEGAL_PERSON`(控件名称或 widget id)
+   - 表单对方企业控件 `FEISHU_FIELD_COMPANY`(当前是「对方单位名称」;信用代码和法人从该外部选项一并取出,不读「对方负责人」)
    - 企查查 `QCC_APP_KEY` / `QCC_SECRET_KEY`(主账号) **以及** `QCC_APP_KEY_MONICA` / `QCC_SECRET_KEY_MONICA`(Monica 账号)。两套都要,只填一套会查不全
    - 远程 MySQL `MYSQL_HOST` / `MYSQL_PORT` / `MYSQL_USER` / `MYSQL_PASSWORD` / `MYSQL_DB`
 4. 安装依赖:`py -m pip install -r requirements.txt`(macOS 用 `python3 -m pip ...`)。外网不通时用内网代理 `http://docker-proxy.xgate.com/simple`。

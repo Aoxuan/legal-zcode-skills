@@ -315,9 +315,7 @@ def _window_ms(days):
 def _company_from_instance(detail, cfg):
     company = extract_company_fields(
         detail.get("form_items") or [],
-        cfg["field_company_name"],
-        cfg["field_credit_code"],
-        cfg["field_legal_person"],
+        cfg["field_company"],
     )
     return company
 

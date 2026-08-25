@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 """表单三要素提取、评论格式、幂等状态。不发起网络请求。"""
-import json
 import os
 import sys
 import tempfile
@@ -12,48 +11,24 @@ if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
 from common.state import StateStore
-from feishu.client import extract_company_fields, parse_form
+from feishu.client import extract_company_fields
 from poll import format_risk_comment, _process_one
+
+_COMBO_WIDGET = "对方单位名称"
+_COMBO_FORM = [{
+    "name": _COMBO_WIDGET,
+    "type": "radioV2",
+    "value": "甲公司｜91ABC｜张三",
+    "option": {"key": "91ABC", "text": "甲公司｜91ABC｜张三"},
+}]
+_CFG = {
+    "field_company": _COMBO_WIDGET,
+    "comment_user_id": "",
+    "comment_user_id_type": "open_id",
+}
 
 
 class FormExtractTests(unittest.TestCase):
-    def test_parse_form_json_string(self):
-        raw = json.dumps([
-            {"id": "widget1", "name": "对方企业名称", "type": "input", "value": "成都讯格得信息科技有限公司"},
-            {"id": "widget2", "name": "统一社会信用代码", "type": "input", "value": "91510100MAXXXX"},
-            {"id": "widget3", "name": "法定代表人", "type": "input", "value": "张三"},
-        ], ensure_ascii=False)
-        items = parse_form(raw)
-        got = extract_company_fields(items, "对方企业名称", "统一社会信用代码", "法定代表人")
-        self.assertEqual(got["name"], "成都讯格得信息科技有限公司")
-        self.assertEqual(got["credit_code"], "91510100MAXXXX")
-        self.assertEqual(got["legal_person"], "张三")
-        self.assertEqual(got["missing"], [])
-
-    def test_match_by_widget_id(self):
-        items = [
-            {"id": "cmp", "name": "公司", "value": "甲公司"},
-            {"id": "cc", "custom_id": "credit", "value": "91ABC"},
-            {"id": "lp", "name": "法人", "value": "李四"},
-        ]
-        got = extract_company_fields(items, "cmp", "credit", "lp")
-        self.assertEqual(got["name"], "甲公司")
-        self.assertEqual(got["credit_code"], "91ABC")
-        self.assertEqual(got["legal_person"], "李四")
-
-    def test_external_option_value_dict(self):
-        items = [
-            {"name": "对方企业名称", "value": {"text": "乙公司"}},
-            {"name": "统一社会信用代码", "value": {"id": "91DEF"}},
-            {"name": "法定代表人", "value": ["王五"]},
-        ]
-        got = extract_company_fields(
-            items, "对方企业名称", "统一社会信用代码", "法定代表人",
-        )
-        self.assertEqual(got["name"], "乙公司")
-        self.assertEqual(got["credit_code"], "91DEF")
-        self.assertEqual(got["legal_person"], "王五")
-
     def test_radio_combo_option(self):
         items = [{
             "id": "widget1",
@@ -64,17 +39,47 @@ class FormExtractTests(unittest.TestCase):
                 "key": "91510108MA67L910XP",
                 "text": "成都白兔有你文化传播有限公司｜91510108MA67L910XP｜陈沛健",
             },
+        }, {
+            "name": "对方负责人",
+            "type": "input",
+            "value": "不该被当成法人的联系人",
         }]
-        got = extract_company_fields(items, "对方单位名称", "对方单位名称", "对方单位名称")
+        got = extract_company_fields(items, "对方单位名称")
         self.assertEqual(got["name"], "成都白兔有你文化传播有限公司")
         self.assertEqual(got["credit_code"], "91510108MA67L910XP")
         self.assertEqual(got["legal_person"], "陈沛健")
         self.assertEqual(got["missing"], [])
 
-    def test_missing_fields(self):
-        got = extract_company_fields([{"name": "对方企业名称", "value": "丙"}], "对方企业名称", "信用代码", "法人")
+    def test_match_by_widget_id(self):
+        items = [{
+            "id": "cmp",
+            "name": "公司",
+            "value": "甲公司｜91ABC｜李四",
+            "option": {"key": "91ABC", "text": "甲公司｜91ABC｜李四"},
+        }]
+        got = extract_company_fields(items, "cmp")
+        self.assertEqual(got["name"], "甲公司")
+        self.assertEqual(got["credit_code"], "91ABC")
+        self.assertEqual(got["legal_person"], "李四")
+
+    def test_name_only_missing_credit(self):
+        got = extract_company_fields(
+            [{"name": "对方单位名称", "value": "丙"}], "对方单位名称",
+        )
         self.assertEqual(got["name"], "丙")
-        self.assertEqual(sorted(got["missing"]), ["credit_code", "legal_person"])
+        self.assertEqual(got["missing"], ["credit_code"])
+
+    def test_legal_person_optional(self):
+        items = [{
+            "name": "对方单位名称",
+            "value": "丁公司｜91XYZ",
+            "option": {"key": "91XYZ", "text": "丁公司｜91XYZ"},
+        }]
+        got = extract_company_fields(items, "对方单位名称")
+        self.assertEqual(got["name"], "丁公司")
+        self.assertEqual(got["credit_code"], "91XYZ")
+        self.assertEqual(got["legal_person"], "")
+        self.assertEqual(got["missing"], [])
 
 
 class StateStoreTests(unittest.TestCase):
@@ -127,21 +132,11 @@ class CommentAndProcessTests(unittest.TestCase):
             self.assertEqual(skip["reason"], "already_processed")
 
     def test_process_comments_and_marks(self):
-        cfg = {
-            "field_company_name": "对方企业名称",
-            "field_credit_code": "统一社会信用代码",
-            "field_legal_person": "法定代表人",
-            "comment_user_id": "",
-            "comment_user_id_type": "open_id",
-        }
+        cfg = dict(_CFG)
         client = mock.Mock()
         client.get_instance.return_value = {
             "status": "PENDING",
-            "form_items": [
-                {"name": "对方企业名称", "value": "甲公司"},
-                {"name": "统一社会信用代码", "value": "91ABC"},
-                {"name": "法定代表人", "value": "张三"},
-            ],
+            "form_items": _COMBO_FORM,
         }
         client.add_comment.return_value = "cmt-1"
         profile = {
@@ -180,19 +175,11 @@ class CommentAndProcessTests(unittest.TestCase):
             )
 
     def test_dry_run_does_not_comment_or_mark(self):
-        cfg = {
-            "field_company_name": "对方企业名称",
-            "field_credit_code": "统一社会信用代码",
-            "field_legal_person": "法定代表人",
-        }
+        cfg = {"field_company": _COMBO_WIDGET}
         client = mock.Mock()
         client.get_instance.return_value = {
             "status": "PENDING",
-            "form_items": [
-                {"name": "对方企业名称", "value": "甲公司"},
-                {"name": "统一社会信用代码", "value": "91ABC"},
-                {"name": "法定代表人", "value": "张三"},
-            ],
+            "form_items": _COMBO_FORM,
         }
         profile = {
             "name": "甲公司", "credit_code": "91ABC", "legal_person": "张三",
@@ -213,21 +200,11 @@ class CommentAndProcessTests(unittest.TestCase):
             client.add_comment.assert_not_called()
 
     def test_process_errors_without_excel(self):
-        cfg = {
-            "field_company_name": "对方企业名称",
-            "field_credit_code": "统一社会信用代码",
-            "field_legal_person": "法定代表人",
-            "comment_user_id": "",
-            "comment_user_id_type": "open_id",
-        }
+        cfg = dict(_CFG)
         client = mock.Mock()
         client.get_instance.return_value = {
             "status": "PENDING",
-            "form_items": [
-                {"name": "对方企业名称", "value": "甲公司"},
-                {"name": "统一社会信用代码", "value": "91ABC"},
-                {"name": "法定代表人", "value": "张三"},
-            ],
+            "form_items": _COMBO_FORM,
         }
         client.list_comments.return_value = []
         profile = {
@@ -248,21 +225,11 @@ class CommentAndProcessTests(unittest.TestCase):
             client.add_comment.assert_not_called()
 
     def test_force_updates_existing_comment(self):
-        cfg = {
-            "field_company_name": "对方企业名称",
-            "field_credit_code": "统一社会信用代码",
-            "field_legal_person": "法定代表人",
-            "comment_user_id": "",
-            "comment_user_id_type": "open_id",
-        }
+        cfg = dict(_CFG)
         client = mock.Mock()
         client.get_instance.return_value = {
             "status": "PENDING",
-            "form_items": [
-                {"name": "对方企业名称", "value": "甲公司"},
-                {"name": "统一社会信用代码", "value": "91ABC"},
-                {"name": "法定代表人", "value": "张三"},
-            ],
+            "form_items": _COMBO_FORM,
         }
         client.add_comment.return_value = "cmt-2"
         client.list_comments.return_value = []

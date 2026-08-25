@@ -14,9 +14,7 @@ load_dotenv(paths.env_path())
 _QCC_REQUIRED = ["QCC_APP_KEY", "QCC_SECRET_KEY"]
 _QCC_MONICA_REQUIRED = ["QCC_APP_KEY_MONICA", "QCC_SECRET_KEY_MONICA"]
 _MYSQL_REQUIRED = ["MYSQL_HOST", "MYSQL_PORT", "MYSQL_USER", "MYSQL_PASSWORD", "MYSQL_DB"]
-_FEISHU_REQUIRED = ["FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_APPROVAL_CODES",
-                    "FEISHU_FIELD_COMPANY_NAME", "FEISHU_FIELD_CREDIT_CODE",
-                    "FEISHU_FIELD_LEGAL_PERSON"]
+_FEISHU_REQUIRED = ["FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_APPROVAL_CODES"]
 
 # 固定使用 Monica 账号的接口(权限受限,主账号无权调用)
 QCC_MONICA_APIS = (886, 2006, 887, 888, 889)
@@ -73,15 +71,24 @@ def get_mysql():
     }
 
 
+def _company_widget():
+    """对方企业那一个表单控件(名称或 widget id)。新名 FEISHU_FIELD_COMPANY,旧名 COMPANY_NAME 仍认。"""
+    v = (os.getenv("FEISHU_FIELD_COMPANY") or os.getenv("FEISHU_FIELD_COMPANY_NAME") or "").strip()
+    if not v:
+        raise RuntimeError(
+            "缺少环境变量 FEISHU_FIELD_COMPANY,请填写审批表单里「对方单位名称」控件名"
+            "(或 widget id)。旧名 FEISHU_FIELD_COMPANY_NAME 仍可用"
+        )
+    return v
+
+
 def get_feishu():
     """飞书自建应用凭据 + 审批配置。缺任一必填项抛 RuntimeError。"""
     return {
         "app_id": _require("FEISHU_APP_ID"),
         "app_secret": _require("FEISHU_APP_SECRET"),
         "approval_codes": [c.strip() for c in (_require("FEISHU_APPROVAL_CODES") or "").split(",") if c.strip()],
-        "field_company_name": _require("FEISHU_FIELD_COMPANY_NAME"),
-        "field_credit_code": _require("FEISHU_FIELD_CREDIT_CODE"),
-        "field_legal_person": _require("FEISHU_FIELD_LEGAL_PERSON"),
+        "field_company": _company_widget(),
         "query_window_days": int(os.getenv("FEISHU_QUERY_WINDOW_DAYS") or "30"),
         "comment_dry_run": (os.getenv("FEISHU_COMMENT_DRY_RUN") or "").lower() in ("1", "true", "yes"),
         "comment_user_id": (os.getenv("FEISHU_COMMENT_USER_ID") or "").strip(),
@@ -94,8 +101,8 @@ def get_feishu():
 _CRED_GROUPS = [
     ("飞书自建应用(必填,审批查询/详情/评论)", _FEISHU_REQUIRED,
      "技能根目录复制 .env.example 为 .env,填写 FEISHU_APP_ID / FEISHU_APP_SECRET(自建应用凭证),"
-     "FEISHU_APPROVAL_CODES(合同审批定义 code,逗号分隔),以及表单企业三要素字段标识 "
-     "FEISHU_FIELD_COMPANY_NAME / FEISHU_FIELD_CREDIT_CODE / FEISHU_FIELD_LEGAL_PERSON"),
+     "FEISHU_APPROVAL_CODES(合同审批定义 code,逗号分隔),以及表单对方企业控件 "
+     "FEISHU_FIELD_COMPANY(当前是「对方单位名称」)"),
     ("企查查-主账号(必填,用于 2006/856/739/887,以及缺 Monica 时回退 886/888/889)", _QCC_REQUIRED,
      "技能根目录复制 .env.example 为 .env,填写 QCC_APP_KEY / QCC_SECRET_KEY(企查查开放平台)"),
     ("企查查-Monica 账号(可选,用于 886/888/889;缺则回退主账号,半套则失败)", _QCC_MONICA_REQUIRED,
@@ -117,6 +124,11 @@ def check_all():
     all_ok = True
     for group, names, ask in _CRED_GROUPS:
         present = [(n, bool((os.getenv(n) or "").strip())) for n in names]
+        if group.startswith("飞书"):
+            present.append((
+                "FEISHU_FIELD_COMPANY",
+                bool((os.getenv("FEISHU_FIELD_COMPANY") or os.getenv("FEISHU_FIELD_COMPANY_NAME") or "").strip()),
+            ))
         present_count = sum(1 for _, p in present if p)
         if group in _OPTIONAL_GROUPS:
             # 全缺=通过(回退主账号);半套=失败;全齐=通过

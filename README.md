@@ -10,8 +10,8 @@
 ## 安装到 zcode
 
 1. 在 zcode「技能」页用本仓库地址安装（或把仓库克隆到 zcode 的 skills 目录）。应出现上面两个技能。
-2. 每个技能文件夹里把 `.env.example` 复制为 `.env` 并填写凭据。**推荐由 IT 私下发一份已填好的 `.env`，法务只负责放到技能目录并保密。**
-3. 每个技能目录装依赖：`py -m pip install -r requirements.txt`（macOS 用 `python3`）。外网不通走内网代理 `http://docker-proxy.xgate.com/simple`。
+2. 每个技能文件夹里把 `.env.example` 复制为 `.env` 并填写凭据。
+3. 每个技能目录装依赖：`py -m pip install -r requirements.txt`（macOS 用 `python3`）。
 4. 自检：
    - 企业风险查询：`py scripts/query.py check`
    - 合同审批风险预警：`py scripts/poll.py check`
@@ -20,7 +20,7 @@
 
 - [docs/法务操作说明书.md](docs/法务操作说明书.md) — 法务日常怎么用，零开发经验可读
 - [docs/配置说明.md](docs/配置说明.md) — 法务/IT 要配什么，`.env` 各项人话解释
-- [docs/飞书应用权限开通指南.md](docs/飞书应用权限开通指南.md) — 给飞书管理员，只开审批三条权限
+- [docs/飞书应用权限开通指南.md](docs/飞书应用权限开通指南.md) — 给飞书管理员：开通应用三条审批权限 + 调整合同审批表单（对方企业名称、企业风险查询两个外部选项单选）
 
 ## 运行环境
 

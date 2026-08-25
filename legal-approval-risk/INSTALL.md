@@ -97,4 +97,4 @@ python3 scripts/poll.py check
 
 1. 使用本租户自建应用，把 `app_id` / `app_secret` 交给每位安装者写入自己的 `.env`（「每人可装」指技能包可分发，凭证仍是租户应用）。
 2. 应用开通并发布：`approval:approval.list:readonly`、`approval:approval:readonly`、`approval:approval`。
-3. 把合同审批定义的 `approval_code`、表单里企业三要素控件名称或 widget id 告诉安装者。
+3. 把合同审批定义的 `approval_code`、表单里「对方单位名称」控件名称告诉安装者（填入 `FEISHU_FIELD_COMPANY`）。
