@@ -7,11 +7,12 @@
   py scripts/poll.py test-instance <code>      干跑单实例,打印 form 与解析结果,不写库
 
 设计口径见 00-对齐/26-自然人审批采集-用户自部署提示词与共表设计.md:
-  - 全状态采集(PENDING/APPROVED/REJECTED/CANCELED),近 N 天窗口(默认 3)
+  - 只采集**已审批通过(APPROVED)**的实例,近 N 天窗口(默认 3);其他状态不采
   - instance_code 已在库 → 跳过,不留状态轨迹
   - 身份证号双写 credit_code + tax_no;审批快照(完整 C1 响应)存 invoice_json
   - 先查后写,禁用 ON DUPLICATE KEY UPDATE;同一自然人已在库且有字段差异 →
     不写库,输出差异清单计「待人工确认」
+  - 身份证号不做硬校验(审批通过即入库),格式异常仅输出提醒(2026-09-03 口径)
 """
 import argparse
 import json
@@ -99,32 +100,20 @@ def _query_page(token, payload, page_token=""):
 
 
 def query_instance_codes(token, approval_code, start_ms, end_ms):
-    """C2:拉时间窗内全部状态的实例 code。
+    """C2:拉时间窗内**已审批通过(APPROVED)**的实例 code(2026-09-03 口志变更:只采通过,
+    审批通过即业务把关,其他状态不再采集)。
     2026-09-03 实测(重要坑):
       - 时间参数名必须是 instance_start_time_from / instance_start_time_to(int 型),
         传 start_time/end_time 会被静默忽略并返回空列表(不报错);
       - 响应取 data.instance_list[].instance.code(嵌套对象),不是 instance_code_list;
-      - instance_status 不传则返回全部状态;传值须为字符串(PENDING/APPROVED),
-        数组报 9499,REJECTED/CANCELED 报 99992402。"""
+      - instance_status 须为字符串;数组报 9499,REJECTED/CANCELED 报 99992402。"""
     payload = {
         "approval_code": approval_code,
+        "instance_status": "APPROVED",
         "instance_start_time_from": int(start_ms),
         "instance_start_time_to": int(end_ms),
     }
-    try:
-        return _collect_pages(token, payload)
-    except RuntimeError as e:
-        if "instance_status" not in str(e):
-            raise
-        codes = []
-        for st in ("PENDING", "APPROVED"):
-            codes.extend(_collect_pages(token, dict(payload, instance_status=st)))
-        seen, uniq = set(), []
-        for c in codes:
-            if c not in seen:
-                seen.add(c)
-                uniq.append(c)
-        return uniq
+    return _collect_pages(token, payload)
 
 
 def _collect_pages(token, payload):
@@ -234,7 +223,7 @@ def extract_person(cfg, by_name):
         "missing_required": [cfg[k] for k, val in
                              (("field_name", None), ("field_id", None))
                              if not grab(k)],
-        # 身份证号格式异常(如控件被配置成单选/性别等)挡在库外,防脏数据
+        # 身份证号格式异常(2026-09-03 口径:不做硬拦截,审批通过即入库,仅输出提醒)
         "id_card_bad": id_card_bad,
         "id_card_bad_value": id_card if id_card_bad else None,
     }
@@ -376,7 +365,8 @@ def cmd_check(cfg):
             codes = query_instance_codes(
                 token, cfg["approval_code"], _ms_days_ago(cfg["window_days"]),
                 int(time.time() * 1000))
-            print("[OK] approval_code 可用,近 %d 天实例 %d 条" % (cfg["window_days"], len(codes)))
+            print("[OK] approval_code 可用,近 %d 天已通过(APPROVED)实例 %d 条"
+                  % (cfg["window_days"], len(codes)))
         except Exception as e:
             ok = False
             print("[FAIL] approval_code: %s" % e)
@@ -430,12 +420,11 @@ def cmd_test_instance(cfg, code):
 
     # 干跑分支判断(只读不写)
     if person["missing_required"]:
-        print("[预判] failed: 必填缺失 %s" % person["missing_required"])
+        print("[预判] failed: 必填缺失 %s(NOT NULL 列,无法入库)" % person["missing_required"])
         return 0
     if person["id_card_bad"]:
-        print("[预判] failed: 身份证号格式异常(值=%r,控件可能配置错误,如单选/性别控件)"
+        print("[提醒] 身份证号格式异常(值=%r)——按现行口径仍会入库,请人工核对"
               % person["id_card_bad_value"])
-        return 0
     conn = db_conn(cfg)
     with conn.cursor() as cur:
         cur.execute("SELECT id FROM `%s` WHERE instance_code=%%s" % cfg["table"], (code,))
@@ -473,8 +462,8 @@ def cmd_poll(cfg):
                                  _ms_days_ago(cfg["window_days"]), int(time.time() * 1000))
     print("[扫描] 近 %d 天实例 %d 条" % (cfg["window_days"], len(codes)))
 
-    stats = {"inserted": 0, "skipped": 0, "confirm": 0, "failed": 0}
-    confirm_details, failed_details, liaison_raw = [], [], []
+    stats = {"inserted": 0, "skipped": 0, "confirm": 0, "warn": 0, "failed": 0}
+    confirm_details, failed_details, warn_details, liaison_raw = [], [], [], []
 
     with conn.cursor() as cur:
         for code in codes:
@@ -494,11 +483,11 @@ def cmd_poll(cfg):
                                            "error": "必填缺失: %s" % person["missing_required"]})
                     continue
                 if person["id_card_bad"]:
-                    stats["failed"] += 1
-                    failed_details.append({"instance_code": code,
-                                           "error": "身份证号格式异常(值=%r,控件疑似配置错误)"
-                                                    % person["id_card_bad_value"]})
-                    continue
+                    # 2026-09-03 口径:不做硬拦截,审批通过即入库,仅输出提醒
+                    stats["warn"] += 1
+                    warn_details.append({"instance_code": code,
+                                         "id_card": person["id_card_bad_value"],
+                                         "hint": "身份证号格式异常,已入库,请人工核对"})
                 if by_name.get(cfg["field_liaison"]) and not _is_plain_text(
                         by_name[cfg["field_liaison"]]):
                     liaison_raw.append(code)  # 人员控件疑似未解析成可读名
@@ -518,8 +507,11 @@ def cmd_poll(cfg):
     conn.close()
 
     print("== 统计 ==")
-    print("新增 %d / 跳过 %d / 待人工确认 %d / 失败 %d" % (
-        stats["inserted"], stats["skipped"], stats["confirm"], stats["failed"]))
+    print("新增 %d / 跳过 %d / 待人工确认 %d / 提醒 %d / 失败 %d" % (
+        stats["inserted"], stats["skipped"], stats["confirm"], stats["warn"], stats["failed"]))
+    if warn_details:
+        print("== 提醒(已入库,请人工核对) ==")
+        print(json.dumps(warn_details, ensure_ascii=False, indent=2))
     if confirm_details:
         print("== 待人工确认(未写库) ==")
         print(json.dumps(confirm_details, ensure_ascii=False, indent=2))
