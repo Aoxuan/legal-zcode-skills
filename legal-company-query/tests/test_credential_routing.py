@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""凭据路由回归测试:验证 886/2006/887/888/889 走 Monica,856/739 走主客户端,且不发起网络请求。
+"""全部接口走同一套客户账号。离线,不触网。
 
 不调用真实企查查接口:用 unittest.mock 替换 QccClient 的各接口方法,断言被调用对象。
 """
@@ -15,7 +15,6 @@ if _SCRIPTS_DIR not in sys.path:
 
 from qcc.aggregator import CompanyAggregator, find_exact_match, Candidate
 from qcc.client import QccClient
-from common.config import QCC_MONICA_APIS
 
 
 def _make_client(app_key: str) -> QccClient:
@@ -24,47 +23,26 @@ def _make_client(app_key: str) -> QccClient:
 
 class CredentialRoutingTests(unittest.TestCase):
     def setUp(self):
-        self.main = _make_client("MAIN")
-        self.monica = _make_client("MONICA")
-        self.agg = CompanyAggregator(self.main, monica_client=self.monica)
-        # 用 mock 替换底层 _get,避免任何真实网络请求
-        self.main._get = mock.MagicMock(return_value={"Status": "200", "Result": {}})
-        self.monica._get = mock.MagicMock(return_value={"Status": "200", "Result": {}})
+        self.client = _make_client("CUST")
+        self.agg = CompanyAggregator(self.client)
+        self.client._get = mock.MagicMock(return_value={"Status": "200", "Result": {}})
 
-    def test_monica_apis_use_monica_client(self):
-        for code in QCC_MONICA_APIS:
+    def test_all_apis_use_single_client(self):
+        for code in (886, 2006, 887, 888, 889, 739):
             with self.subTest(code=code):
                 self.agg._call(code, search_key="某公司")
-                self.monica._get.assert_called()
-                self.main._get.assert_not_called()
+                self.client._get.assert_called()
+                self.client._get.reset_mock()
+        self.agg._call(856, credit_code="c", company_name="n", oper_name="o")
+        self.client._get.assert_called()
 
-    def test_main_apis_use_main_client(self):
-        for code in (856, 739):
-            with self.subTest(code=code):
-                if code == 856:
-                    self.agg._call(code, credit_code="c", company_name="n", oper_name="o")
-                else:
-                    self.agg._call(code, search_key="某公司")
-                self.main._get.assert_called()
-                self.monica._get.assert_not_called()
-                # 重置以便下一轮独立断言
-                self.main._get.reset_mock()
-                self.monica._get.reset_mock()
-
-    def test_no_monica_client_falls_back_to_main(self):
-        """显式不提供 Monica 客户端时回退主客户端(仅用于无网络测试场景)。"""
-        agg = CompanyAggregator(self.main, monica_client=None)
-        agg._call(886, search_key="某公司")
-        self.assertEqual(self.main._get.call_count, 1)
-
-    def test_search_candidates_uses_monica_for_886(self):
-        self.monica._get.return_value = {
+    def test_search_candidates_uses_same_client(self):
+        self.client._get.return_value = {
             "Status": "200",
             "Result": [{"Name": "某公司", "CreditCode": "X", "OperName": "张三", "Status": "存续"}],
         }
         out = self.agg.search_candidates("某公司")
-        self.monica._get.assert_called_once()
-        self.main._get.assert_not_called()
+        self.client._get.assert_called_once()
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0].name, "某公司")
 
@@ -88,43 +66,18 @@ class ExactMatchTests(unittest.TestCase):
         self.assertIsNone(find_exact_match([], "甲公司"))
 
 
-class ConfigMonicaFallbackTests(unittest.TestCase):
-    def test_get_qcc_monica_falls_back_to_main_when_missing(self):
-        """缺 Monica 两项时回退主账号(生产账号已开通全部接口,只填两项)。"""
-        env = {k: v for k, v in os.environ.items()
-               if k not in ("QCC_APP_KEY_MONICA", "QCC_SECRET_KEY_MONICA")}
-        env["QCC_APP_KEY"] = "MAIN_KEY"
-        env["QCC_SECRET_KEY"] = "MAIN_SECRET"
-        with mock.patch.dict(os.environ, env, clear=True):
-            from common.config import get_qcc_monica
-            creds = get_qcc_monica()
-            self.assertEqual(creds["app_key"], "MAIN_KEY")
-            self.assertEqual(creds["secret_key"], "MAIN_SECRET")
-
-    def test_get_qcc_monica_uses_monica_when_present(self):
+class ConfigQccTests(unittest.TestCase):
+    def test_get_qcc_reads_customer_keys(self):
         env = {
-            "QCC_APP_KEY": "MAIN_KEY", "QCC_SECRET_KEY": "MAIN_SECRET",
-            "QCC_APP_KEY_MONICA": "MONICA_KEY", "QCC_SECRET_KEY_MONICA": "MONICA_SECRET",
+            "QCC_APP_KEY": "CUST_KEY", "QCC_SECRET_KEY": "CUST_SECRET",
         }
         with mock.patch.dict(os.environ, env, clear=True):
-            from common.config import get_qcc_monica
-            creds = get_qcc_monica()
-            self.assertEqual(creds["app_key"], "MONICA_KEY")
-            self.assertEqual(creds["secret_key"], "MONICA_SECRET")
+            from common.config import get_qcc
+            creds = get_qcc()
+            self.assertEqual(creds["app_key"], "CUST_KEY")
+            self.assertEqual(creds["secret_key"], "CUST_SECRET")
 
-    def test_get_qcc_monica_raises_on_half(self):
-        """有 AppKey 无 Secret 仍报错,不拿主账号 Secret 拼 Monica Key。"""
-        env = {
-            "QCC_APP_KEY": "MAIN_KEY", "QCC_SECRET_KEY": "MAIN_SECRET",
-            "QCC_APP_KEY_MONICA": "MONICA_KEY",
-        }
-        with mock.patch.dict(os.environ, env, clear=True):
-            from common.config import get_qcc_monica
-            with self.assertRaises(RuntimeError) as ctx:
-                get_qcc_monica()
-            self.assertIn("QCC_SECRET_KEY_MONICA", str(ctx.exception))
-
-    def test_get_qcc_main_raises_when_missing(self):
+    def test_get_qcc_raises_when_missing(self):
         env = {k: v for k, v in os.environ.items()
                if k not in ("QCC_APP_KEY", "QCC_SECRET_KEY")}
         with mock.patch.dict(os.environ, env, clear=True):
@@ -220,6 +173,56 @@ class CmdProfileCacheTests(unittest.TestCase):
         agg.fetch_profile.assert_called_once()
         # 强制刷新应写回新版本(库中现有 2 行:旧 cache + 新 live)
         self.assertEqual(len(store.rows), 2)
+
+
+class CmdSearchLocalTests(unittest.TestCase):
+    """search 应先读 legal_company 维度表:恰好 1 条则不调 886(source=local)。"""
+
+    def setUp(self):
+        import io
+        import query
+        self.q = query
+        self._stdout = sys.stdout
+        sys.stdout = io.StringIO()
+
+    def tearDown(self):
+        sys.stdout = self._stdout
+
+    def _run_search(self, store, agg):
+        with mock.patch.object(self.q, "_require_qcc", return_value=True), \
+             mock.patch.object(self.q, "store_from_env", return_value=store), \
+             mock.patch.object(self.q, "default_aggregator", return_value=agg):
+            return self.q.cmd_search("成都讯格得信息科技有限公司")
+
+    def test_local_match_skips_886(self):
+        from common.company_store import MemoryCompanyStore
+        from qcc.aggregator import CompanyProfile
+        store = MemoryCompanyStore()
+        store.insert(CompanyProfile(
+            name="成都讯格得信息科技有限公司", credit_code="91X", legal_person="邱昊",
+            status="存续", three_element_ok=True, risk_level="low", hits=[],
+            cost=7.5, called_apis=[2006], payloads={}, query_date="2026-08-01 10:00:00",
+            source="qcc_live"))
+        agg = mock.MagicMock()
+        agg.search_candidates.side_effect = AssertionError("本地命中不应调 886")
+        rc = self._run_search(store, agg)
+        out = json.loads(sys.stdout.getvalue())
+        self.assertEqual(rc, 0)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["count"], 1)
+        self.assertTrue(out["exact_match"])
+        self.assertEqual(out["source"], "local")
+        agg.search_candidates.assert_not_called()
+
+    def test_no_store_falls_back_to_886(self):
+        agg = mock.MagicMock()
+        agg.search_candidates.return_value = [Candidate("成都讯格得信息科技有限公司", "91X", "邱昊", "存续")]
+        rc = self._run_search(None, agg)
+        out = json.loads(sys.stdout.getvalue())
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["count"], 1)
+        self.assertNotIn("source", out)             # 走 886 路径,无 source=local
+        agg.search_candidates.assert_called_once()
 
 
 if __name__ == "__main__":

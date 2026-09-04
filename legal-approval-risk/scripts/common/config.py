@@ -12,12 +12,8 @@ from common import paths
 load_dotenv(paths.env_path())
 
 _QCC_REQUIRED = ["QCC_APP_KEY", "QCC_SECRET_KEY"]
-_QCC_MONICA_REQUIRED = ["QCC_APP_KEY_MONICA", "QCC_SECRET_KEY_MONICA"]
 _MYSQL_REQUIRED = ["MYSQL_HOST", "MYSQL_PORT", "MYSQL_USER", "MYSQL_PASSWORD", "MYSQL_DB"]
 _FEISHU_REQUIRED = ["FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_APPROVAL_CODES"]
-
-# 固定使用 Monica 账号的接口(权限受限,主账号无权调用)
-QCC_MONICA_APIS = (886, 2006, 887, 888, 889)
 
 
 def _require(name):
@@ -27,26 +23,24 @@ def _require(name):
     return v
 
 
+def _approver_user_id():
+    """预审节点审批人账号(本技能以该账号同意任务并回填评级/附件)。
+
+    优先 FEISHU_APPROVER_USER_ID;未填则回退到 FEISHU_COMMENT_USER_ID(同一员工账号)。
+    """
+    return (os.getenv("FEISHU_APPROVER_USER_ID") or os.getenv("FEISHU_COMMENT_USER_ID") or "").strip()
+
+
+def _approver_user_id_type():
+    return (os.getenv("FEISHU_APPROVER_USER_ID_TYPE")
+            or os.getenv("FEISHU_COMMENT_USER_ID_TYPE") or "open_id").strip()
+
+
 def get_qcc():
-    """主账号凭据,用于 856/739。"""
+    """企查查客户账号凭据。全部接口走这一套。"""
     return {
         "app_key": _require("QCC_APP_KEY"),
         "secret_key": _require("QCC_SECRET_KEY"),
-    }
-
-
-def get_qcc_monica():
-    """Monica 凭据,固定用于 886/2006/887/888/889。
-
-    可选:无 QCC_APP_KEY_MONICA 时回退主账号(生产账号已开通全部接口,只需填两项)。
-    半套(有 AppKey 无 Secret)仍报错,不拿主账号 Secret 拼 Monica Key。
-    """
-    monica_key = os.getenv("QCC_APP_KEY_MONICA")
-    if not monica_key:
-        return get_qcc()
-    return {
-        "app_key": monica_key,
-        "secret_key": _require("QCC_SECRET_KEY_MONICA"),
     }
 
 
@@ -71,54 +65,90 @@ def get_mysql():
     }
 
 
-def _company_widget():
-    """对方企业那一个表单控件(名称或 widget id)。新名 FEISHU_FIELD_COMPANY,旧名 COMPANY_NAME 仍认。"""
+def _company_fields():
+    """表单里的候选企业控件(名称或 widget id),多个用逗号分隔。
+
+    新名 FEISHU_FIELD_COMPANY,旧名 FEISHU_FIELD_COMPANY_NAME 仍认。
+    字段名不固定:可能是「对方单位名称」「相对方企业名称」「签约企业名称」「达人公司名称」,
+    都是外部选项单选,值形如「名称｜信用代码｜法人」。表单里命中的字段都没出现则跳过该实例。
+    """
     v = (os.getenv("FEISHU_FIELD_COMPANY") or os.getenv("FEISHU_FIELD_COMPANY_NAME") or "").strip()
-    if not v:
+    fields = []
+    for part in v.replace("，", ",").split(","):
+        part = part.strip()
+        if part and part not in fields:
+            fields.append(part)
+    if not fields:
         raise RuntimeError(
-            "缺少环境变量 FEISHU_FIELD_COMPANY,请填写审批表单里「对方单位名称」控件名"
-            "(或 widget id)。旧名 FEISHU_FIELD_COMPANY_NAME 仍可用"
+            "缺少环境变量 FEISHU_FIELD_COMPANY,请填写审批表单里的企业控件名,"
+            "多个用逗号分隔(如 对方单位名称,相对方企业名称,签约企业名称,达人公司名称;"
+            "也可以是 widget id)。旧名 FEISHU_FIELD_COMPANY_NAME 仍可用"
         )
-    return v
+    return fields
+
+
+def _rating_field():
+    """回填目标:【企业风险评级】文本控件名(或 widget id)。默认「企业风险评级」。"""
+    return (os.getenv("FEISHU_FIELD_RATING") or "企业风险评级").strip()
+
+
+def _attachment_field():
+    """回填目标:【附件】附件控件名(或 widget id)。默认「附件」。"""
+    return (os.getenv("FEISHU_FIELD_ATTACHMENT") or "附件").strip()
+
+
+def _cache_days():
+    """企业风险信息库缓存有效天数;超过则重查企查查。默认 90(近 3 个月)。"""
+    raw = (os.getenv("FEISHU_CACHE_DAYS") or "90").strip()
+    try:
+        days = int(raw)
+    except ValueError:
+        days = 90
+    return max(days, 1)
 
 
 def get_feishu():
-    """飞书自建应用凭据 + 审批配置。缺任一必填项抛 RuntimeError。"""
+    """飞书自建应用凭据 + 审批配置。缺任一必填项抛 RuntimeError。
+
+    approver_user_id 可空(仅 test-instance 干跑允许);poll/check 必须配齐。
+    """
     return {
         "app_id": _require("FEISHU_APP_ID"),
         "app_secret": _require("FEISHU_APP_SECRET"),
         "approval_codes": [c.strip() for c in (_require("FEISHU_APPROVAL_CODES") or "").split(",") if c.strip()],
-        "field_company": _company_widget(),
+        "field_companies": _company_fields(),
         "query_window_days": int(os.getenv("FEISHU_QUERY_WINDOW_DAYS") or "30"),
         "comment_dry_run": (os.getenv("FEISHU_COMMENT_DRY_RUN") or "").lower() in ("1", "true", "yes"),
         "comment_user_id": (os.getenv("FEISHU_COMMENT_USER_ID") or "").strip(),
         "comment_user_id_type": (os.getenv("FEISHU_COMMENT_USER_ID_TYPE") or "open_id").strip(),
+        "approver_user_id": _approver_user_id(),
+        "approver_user_id_type": _approver_user_id_type(),
+        "field_rating": _rating_field(),
+        "field_attachment": _attachment_field(),
+        "cache_days": _cache_days(),
     }
 
 
 # ---- 凭据体检:飞书 + 企查查 + MySQL 三组均必填 ----
 
 _CRED_GROUPS = [
-    ("飞书自建应用(必填,审批查询/详情/评论)", _FEISHU_REQUIRED,
+    ("飞书自建应用(必填,审批查询/详情/同意任务)", _FEISHU_REQUIRED,
      "技能根目录复制 .env.example 为 .env,填写 FEISHU_APP_ID / FEISHU_APP_SECRET(自建应用凭证),"
-     "FEISHU_APPROVAL_CODES(合同审批定义 code,逗号分隔),以及表单对方企业控件 "
-     "FEISHU_FIELD_COMPANY(当前是「对方单位名称」)"),
-    ("企查查-主账号(必填,用于 2006/856/739/887,以及缺 Monica 时回退 886/888/889)", _QCC_REQUIRED,
+     "FEISHU_APPROVAL_CODES(合同审批定义 code,逗号分隔),以及表单企业控件 "
+     "FEISHU_FIELD_COMPANY(多个逗号分隔,如 对方单位名称,相对方企业名称,签约企业名称,达人公司名称;"
+     "命中的字段都没出现则跳过该实例)。应用需补开 approval:task(同意任务)权限"),
+    ("企查查(必填,全部接口走客户账号)", _QCC_REQUIRED,
      "技能根目录复制 .env.example 为 .env,填写 QCC_APP_KEY / QCC_SECRET_KEY(企查查开放平台)"),
-    ("企查查-Monica 账号(可选,用于 886/888/889;缺则回退主账号,半套则失败)", _QCC_MONICA_REQUIRED,
-     "技能根目录 .env 补齐 QCC_APP_KEY_MONICA / QCC_SECRET_KEY_MONICA(测试账号,固定用于 886/888/889);生产账号已开通全部接口时可留空"),
     ("远程 MySQL(必填,缺则无法使用本技能)", _MYSQL_REQUIRED,
      "技能根目录 .env 补齐 MYSQL_HOST / MYSQL_PORT / MYSQL_USER / MYSQL_PASSWORD / MYSQL_DB"),
 ]
 
-# 可选凭据组:全部缺失视为通过(回退主账号),半套缺失才失败
-_OPTIONAL_GROUPS = {"企查查-Monica 账号(可选,用于 886/888/889;缺则回退主账号,半套则失败)"}
 
+def check_all(require_approver=True):
+    """一次性体检飞书 + 企查查 + MySQL(+ 预审账号)。返回 (ok: bool, report: list[dict])。
 
-def check_all():
-    """一次性体检飞书 + 企查查 + MySQL。返回 (ok: bool, report: list[dict])。
-
-    缺任一必填即 ok=False,不抛异常。可选组(Monica)全缺视为通过,半套才失败。
+    缺任一必填即 ok=False,不抛异常。require_approver=False 时预审账号缺失不拉低 ok
+    (供 test-instance 干跑核实控件用);poll/check 默认要求预审账号。
     """
     report = []
     all_ok = True
@@ -129,12 +159,7 @@ def check_all():
                 "FEISHU_FIELD_COMPANY",
                 bool((os.getenv("FEISHU_FIELD_COMPANY") or os.getenv("FEISHU_FIELD_COMPANY_NAME") or "").strip()),
             ))
-        present_count = sum(1 for _, p in present if p)
-        if group in _OPTIONAL_GROUPS:
-            # 全缺=通过(回退主账号);半套=失败;全齐=通过
-            group_ok = (present_count == 0) or (present_count == len(names))
-        else:
-            group_ok = all(p for _, p in present)
+        group_ok = all(p for _, p in present)
         if not group_ok:
             all_ok = False
         report.append({
@@ -143,6 +168,22 @@ def check_all():
             "all_present": group_ok,
             "ask": ask if not group_ok else "",
         })
+
+    # 预审审批账号(poll/check 必填;test-instance 干跑可缺)
+    approver_id = _approver_user_id()
+    approver_present = bool(approver_id)
+    approver_ok = True if not require_approver else approver_present
+    if not approver_ok:
+        all_ok = False
+    report.append({
+        "group": "预审审批账号(poll 必填,FEISHU_APPROVER_USER_ID;未填可回退 FEISHU_COMMENT_USER_ID)",
+        "vars": [("FEISHU_APPROVER_USER_ID", approver_present)],
+        "all_present": approver_present,
+        "ask": ("在审批流新增「系统风险预审」节点,审批人=该员工账号;在 .env 填写 "
+                "FEISHU_APPROVER_USER_ID(其 open_id,或复用 FEISHU_COMMENT_USER_ID)。"
+                "用手机号/邮箱反查 open_id 见 SKILL.md") if not approver_present else "",
+        "required": require_approver,
+    })
     return all_ok, report
 
 

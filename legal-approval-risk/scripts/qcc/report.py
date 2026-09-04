@@ -26,10 +26,26 @@ HEADER_FILL = PatternFill("solid", start_color="1F4E78")
 HEADER_FONT = Font(name=FONT, bold=True, color="FFFFFF")
 SECTION_FILL = PatternFill("solid", start_color="D9E1F2")
 SECTION_FONT = Font(name=FONT, bold=True, color="1F4E78")
+# 命中风险的指标行整行黄色高亮,便于审批人不遗漏风险项
+RISK_FILL = PatternFill("solid", start_color="FFFF00")
 WRAP = Alignment(wrap_text=True, vertical="top")
 CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
 THIN = Side(style="thin", color="BFBFBF")
 BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+
+# 不代表风险的取值(无记录/接口未开通/无变更),这些行不高亮
+_NO_RISK_VALUES = {"无记录", "无数据(接口未开通)", "未开通(214)", "近1年无变更记录"}
+# 登记状态含这些词才视为风险(正常存续不高亮)
+_STATUS_RISK_WORDS = ("吊销", "注销", "停业", "撤销", "清算中")
+
+
+def _is_risk_hit(group: str, name: str, val: str) -> bool:
+    """该指标行是否命中风险(用于黄色高亮;口径与风险分级一致,宁可高亮不遗漏)。"""
+    if name == "存续/注销/吊销/迁出":  # 登记状态:正常存续/在业不算风险
+        return any(w in val for w in _STATUS_RISK_WORDS)
+    if name.startswith("三要素"):  # 一致性:非「一致」即风险
+        return not val.startswith("一致")
+    return val not in _NO_RISK_VALUES
 
 
 # ---- 取值辅助(移植自 01-poc/build_legal_review_xlsx.py,口径不变) ----
@@ -289,6 +305,7 @@ def build_report(company: str, payloads: Dict[int, Any], out_dir: str,
         ("命中项数", str(len((profile or {}).get("hits", []))) if profile else "—"),
         ("调用接口", ", ".join(str(c) for c in (profile or {}).get("called_apis", [])) if profile else "—"),
         ("本次成本(元)", str((profile or {}).get("cost", "")) if profile else "—"),
+        ("高亮说明", "黄色行=命中风险项,需重点审阅"),
     ]
     for name, val in summary_rows:
         ws.append([name, val])
@@ -308,11 +325,14 @@ def build_report(company: str, payloads: Dict[int, Any], out_dir: str,
             val = "无数据(接口未开通)"
         ws.append([name, val])
         r = ws.max_row
+        hit = group != "主体回填" and _is_risk_hit(group, name, val)
         for c in (1, 2):
             cell = ws.cell(row=r, column=c)
             cell.alignment = WRAP
             cell.border = BORDER
             cell.font = Font(name=FONT)
+            if hit:
+                cell.fill = RISK_FILL
 
     _autofit(ws, [28, 90])
     ws.freeze_panes = "A2"

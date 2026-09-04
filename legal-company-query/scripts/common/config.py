@@ -13,11 +13,7 @@ from common import paths
 load_dotenv(paths.env_path())
 
 _QCC_REQUIRED = ["QCC_APP_KEY", "QCC_SECRET_KEY"]
-_QCC_MONICA_REQUIRED = ["QCC_APP_KEY_MONICA", "QCC_SECRET_KEY_MONICA"]
 _MYSQL_REQUIRED = ["MYSQL_HOST", "MYSQL_PORT", "MYSQL_USER", "MYSQL_PASSWORD", "MYSQL_DB"]
-
-# 固定使用 Monica 账号的接口(权限受限,主账号无权调用)
-QCC_MONICA_APIS = (886, 2006, 887, 888, 889)
 
 
 def _require(name):
@@ -28,25 +24,10 @@ def _require(name):
 
 
 def get_qcc():
-    """主账号凭据,用于 856/739。"""
+    """企查查客户账号凭据。全部接口走这一套。"""
     return {
         "app_key": _require("QCC_APP_KEY"),
         "secret_key": _require("QCC_SECRET_KEY"),
-    }
-
-
-def get_qcc_monica():
-    """Monica 凭据,固定用于 886/2006/887/888/889。
-
-    可选:无 QCC_APP_KEY_MONICA 时回退主账号(生产账号已开通全部接口,只需填两项)。
-    半套(有 AppKey 无 Secret)仍报错,不拿主账号 Secret 拼 Monica Key。
-    """
-    monica_key = os.getenv("QCC_APP_KEY_MONICA")
-    if not monica_key:
-        return get_qcc()
-    return {
-        "app_key": monica_key,
-        "secret_key": _require("QCC_SECRET_KEY_MONICA"),
     }
 
 
@@ -74,33 +55,23 @@ def get_mysql():
 # ---- 凭据体检:企查查 + MySQL 两组均必填 ----
 
 _CRED_GROUPS = [
-    ("企查查-主账号(必填,用于 2006/856/739/887,以及缺 Monica 时回退 886/888/889)", _QCC_REQUIRED,
+    ("企查查(必填,全部接口走客户账号)", _QCC_REQUIRED,
      "技能根目录复制 .env.example 为 .env,填写 QCC_APP_KEY / QCC_SECRET_KEY(企查查开放平台)"),
-    ("企查查-Monica 账号(可选,用于 886/888/889;缺则回退主账号,半套则失败)", _QCC_MONICA_REQUIRED,
-     "技能根目录 .env 补齐 QCC_APP_KEY_MONICA / QCC_SECRET_KEY_MONICA(测试账号,固定用于 886/888/889);生产账号已开通全部接口时可留空"),
     ("远程 MySQL(必填,缺则无法使用本技能)", _MYSQL_REQUIRED,
      "技能根目录 .env 补齐 MYSQL_HOST / MYSQL_PORT / MYSQL_USER / MYSQL_PASSWORD / MYSQL_DB"),
 ]
-
-# 可选凭据组:全部缺失视为通过(回退主账号),半套缺失才失败
-_OPTIONAL_GROUPS = {"企查查-Monica 账号(可选,用于 886/888/889;缺则回退主账号,半套则失败)"}
 
 
 def check_all():
     """一次性体检企查查 + MySQL。返回 (ok: bool, report: list[dict])。
 
-    缺任一必填即 ok=False,不抛异常。可选组(Monica)全缺视为通过,半套才失败。
+    缺任一必填即 ok=False,不抛异常。
     """
     report = []
     all_ok = True
     for group, names, ask in _CRED_GROUPS:
         present = [(n, bool((os.getenv(n) or "").strip())) for n in names]
-        present_count = sum(1 for _, p in present if p)
-        if group in _OPTIONAL_GROUPS:
-            # 全缺=通过(回退主账号);半套=失败;全齐=通过
-            group_ok = (present_count == 0) or (present_count == len(names))
-        else:
-            group_ok = all(p for _, p in present)
+        group_ok = all(p for _, p in present)
         if not group_ok:
             all_ok = False
         report.append({

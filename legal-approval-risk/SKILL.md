@@ -1,15 +1,14 @@
 ---
 name: legal-approval-risk
-description: 定时扫描飞书里待审批(PENDING)的合同审批,读取表单里已选定的对方企业三要素,拉取企查查风险并评论回该审批实例。当用户要轮询合同审批风险、给待审批合同补风险预警、检查 PENDING 审批的签约对象风险、安装或运行 legal-approval-risk 时,务必使用本技能。
+description: 定时扫描预审员工账号在飞书合同审批里的待办任务,从表单企业控件(客户名称/供应商名称/达人企业名称,三者必现其一)取对方企业三要素,缓存优先(近3个月)拉取企查查风险,自然人(dim_company 判定)免查回填固定文案,用 tasks/approve 把风险评级回填到【企业风险评级】字段(低/中/高风险把 Excel 风险报告写入「风险报告附件」专用控件,两控件只保留技能写入内容,申请人误写/误传一并删除)后同意放行给法务。当用户要轮询合同审批风险、给待审批合同补风险评级与报告、安装或运行 legal-approval-risk 时,务必使用本技能。
 ---
 
-# 合同审批风险预警技能
+# 合同审批风险预审技能
 
-本技能扫描飞书里 **PENDING(待审批)** 的合同审批,从表单读取已确定的对方企业(全称 + 统一社会信用代码 + 法定代表人),复用企查查风险引擎给出低/中/高分级,并在该审批实例的**评论区**写一条简短风险预警 + 完整风险 Excel 附件。同一实例只评论一次。
+本技能作为合同审批流里**「系统风险预审」节点**的审批人(一个固定员工账号)。它扫描该账号在合同审批定义下的**待办任务**,从表单企业控件(外部选项单选,值「名称｜统一社会信用代码｜法定代表人」;字段为「客户名称」「供应商名称」「达人企业名称」三者之一,互斥、必现其一)读取对方企业三要素,**先查 MySQL 近 N 天(默认 90 天)缓存**,命中则零成本复用;未命中先查 **dim_company 判定自然人**——对方是个人则不查企查查,回填「自然人无须评估风险」;是企业才调企查查风险接口、落快照、写 MySQL,并生成 Excel 风险报告。随后用 `tasks/approve` 的 `form` 回填**【企业风险评级】文本字段**;**低/中/高风险**均把 Excel 报告写入 **「风险报告附件」控件(attachmentV2,专用控件)**:两控件**只保留本技能写入的内容**——附件控件整体设值为 `[报告code]`,申请人误传的文件**一并删除**;未知/自然人/兜底不附报告,但若申请人误传过文件则**清空**该控件(清空被飞书拒绝时去掉清空条目重试放行,降级为提醒,不阻塞)。随后**同意放行**给法务节点。
 
-评论文案只保留:查询日期、风险评级、风险命中项,并附一句「完整风险信息见附件 Excel」。明细全部在附件 Excel 里。
-
-企业已在表单选定,**不要再跑模糊搜索/匹配**。开发源为仓库内 `法务合同签约技能/01-poc/`;本目录是可安装发行副本。
+预审节点**一律同意放行**:高/中/低风险都交给法务人工判断,不自动拦截。表单企业字段为必填,正常不会为空;若取不到企业或缺三要素,【企业风险评级】回填兜底文案「企业名称为空,风险查询接口不适用」并照常放行。
+开发源为仓库内 `法务合同签约技能/skills/legal-approval-risk/`;本目录是可安装发行副本。
 
 ## 前置:凭据与依赖
 
@@ -20,24 +19,30 @@ description: 定时扫描飞书里待审批(PENDING)的合同审批,读取表单
 3. 复制 `.env.example` 为 `.env`。**向用户索取**并写入下列凭据,缺则不要硬跑:
    - 飞书自建应用 `FEISHU_APP_ID` / `FEISHU_APP_SECRET`
    - 合同审批定义 `FEISHU_APPROVAL_CODES`(多个用逗号分隔)
-   - 表单对方企业控件 `FEISHU_FIELD_COMPANY`(当前是「对方单位名称」;信用代码和法人从该外部选项一并取出,不读「对方负责人」)
-   - 企查查 `QCC_APP_KEY` / `QCC_SECRET_KEY`(主账号) **以及** `QCC_APP_KEY_MONICA` / `QCC_SECRET_KEY_MONICA`(Monica 账号)。两套都要,只填一套会查不全
+   - 表单候选企业控件 `FEISHU_FIELD_COMPANY`(多个逗号分隔:`客户名称,供应商名称,达人企业名称`,三者互斥、必现其一;三要素从命中的外部选项一并取出,不读「对方负责人」)
+   - 回填控件 `FEISHU_FIELD_RATING`(默认 `企业风险评级`)、`FEISHU_FIELD_ATTACHMENT`(默认 `附件`)
+   - 预审审批账号 `FEISHU_APPROVER_USER_ID`(其 `open_id`;未填则回退 `FEISHU_COMMENT_USER_ID`)
+   - 缓存窗口 `FEISHU_CACHE_DAYS`(默认 `90`)
+   - 企查查 `QCC_APP_KEY` / `QCC_SECRET_KEY`(客户账号,全部接口走这一套)
    - 远程 MySQL `MYSQL_HOST` / `MYSQL_PORT` / `MYSQL_USER` / `MYSQL_PASSWORD` / `MYSQL_DB`
 4. 安装依赖:`py -m pip install -r requirements.txt`(macOS 用 `python3 -m pip ...`)。外网不通时用内网代理 `http://docker-proxy.xgate.com/simple`。
-5. 自检:`py scripts/poll.py check`。飞书 token + 审批 code + 企查查 + MySQL 均就绪才算通过。
+5. 自检:`py scripts/poll.py check`。飞书 token + 审批 code + 企查查 + MySQL + 预审账号均就绪才算通过。
 
 缺 Python 指向 [INSTALL.md](INSTALL.md);缺凭据则按 `.env.example` 向用户逐项索取并写入技能根目录 `.env`。不要把密钥写进对话记录或提交到 git。
 
-### 飞书应用权限(管理员须先开通并发布)
+### 飞书侧准备(管理员须先做)
 
-本技能用应用身份(`tenant_access_token`)读审批、写评论,需在自建应用开通后**保存 → 创建版本 → 发布 → 管理员审批**。完整步骤见交付文档《飞书应用权限开通指南》。最小权限:
+**审批定义改造(关键)**:在合同审批定义里新增**「系统风险预审」节点**,审批人 = 预审员工账号,排在法务节点之前;在该节点把**【企业风险评级】设为非必填 + 可编辑**、把**附件目标控件(FEISHU_FIELD_ATTACHMENT,当前为「风险报告附件」专用控件)设为可编辑**。没有这个节点,API 无处回填字段(飞书原生审批只能在「同意某审批任务」时用 `form` 写表单控件值,没有单独改实例字段的接口;附件控件也是整体设值,技能写入的内容会替换控件里已有值——该控件为技能专用,申请人误传的文件会被一并删除)。
 
-- `approval:approval.list:readonly`(查询实例列表)
+**应用权限**(自建应用开通后**保存 → 创建版本 → 发布 → 管理员审批**):
+
+- `approval:approval.list:readonly`(查询实例列表,兼容保留)
 - `approval:approval:readonly`(实例详情)
-- `approval:approval`(创建评论,含写)
-- `contact:user.id:readonly`(手机号/邮箱反查 open_id,用于指定评论发表人)
+- `approval:task`(同意/拒绝任务,**本技能回填字段必需**)
+- `approval:task:list_by_user`(查询用户待办任务,或 `approval:approval:readonly`)
+- `contact:user.id:readonly`(手机号/邮箱反查 open_id)
 
-本技能**不需要**机器人、消息事件、webhook。租户写评论必须带 `FEISHU_COMMENT_USER_ID`(及可选的 `FEISHU_COMMENT_USER_ID_TYPE`,默认 `open_id`)。没有现成 `open_id` 时,向用户要**手机号或个人邮箱**(不要企业邮箱);`FEISHU_APP_ID` / `FEISHU_APP_SECRET` 已写入 `.env` 后,用 `tenant_access_token` 调 `POST /open-apis/contact/v3/users/batch_get_id?user_id_type=open_id`,把返回的 `open_id` 写入技能根目录 `.env` 的 `FEISHU_COMMENT_USER_ID`。不要把手机号/邮箱写入对话以外的文件,不要提交 `.env`。查不到则提示检查 `contact:user.id:readonly` 已发版,且该账号在应用通讯录权限范围内。
+预审账号必须带 `FEISHU_APPROVER_USER_ID`(及 `FEISHU_APPROVER_USER_ID_TYPE`,默认 `open_id`)。没有现成 `open_id` 时,向用户要**手机号或个人邮箱**(不要企业邮箱);`FEISHU_APP_ID` / `FEISHU_APP_SECRET` 已写入 `.env` 后,用 `tenant_access_token` 调 `POST /open-apis/contact/v3/users/batch_get_id?user_id_type=open_id`,把返回的 `open_id` 写入 `.env` 的 `FEISHU_APPROVER_USER_ID`。不要把手机号/邮箱写入对话以外的文件,不要提交 `.env`。查不到则提示检查 `contact:user.id:readonly` 已发版,且该账号在应用通讯录权限范围内。
 
 ## 工作流程
 
@@ -49,21 +54,21 @@ py scripts/poll.py check
 
 输出 `{ok, report, mysql_connected, feishu_token, approval_codes}`。`ok != true` 时把 `error` 用自然语言转告用户,按缺失项补 `.env`,不要暴露堆栈。
 
-### 干跑一条已知实例(验收,不写评论)
+### 干跑一条已知实例(验收,不 approve)
 
 ```
 py scripts/poll.py test-instance <instance_code>
 ```
 
-输出 `{ok, instance_code, status, company, profile, comment_preview, commented:false}`。用于确认表单字段映射与风险结果,再开正式轮询。
+输出 `{ok, instance_code, status, companies, company, profile, rating_text, located_controls, form_preview, approve:false}`。用于确认表单字段映射、回填控件定位(【企业风险评级】/「附件」的 id+type)与风险结果,再开正式轮询。干跑**缓存优先**(不强制查企查查),不上传附件、不 approve。
 
-### 补写/改写一条实例的评论(短文本 + Excel)
+### 补处理单条实例(始终缓存优先,--force 强制重查)
 
 ```
-py scripts/poll.py comment-instance <instance_code>
+py scripts/poll.py process-instance <instance_code> [--force]
 ```
 
-始终调企查查最新接口(约 7.50 元),生成完整风险 Excel 后写入或改写该实例的风险评论。数据库缓存只给人工查询技能 `legal-company-query` 用,本技能不走缓存。
+在预审账号待办里找到该实例并 approve 回填。`--force` 忽略缓存强制重查企查查。
 
 ### 一趟扫描(loop 每次触发跑这一条)
 
@@ -71,16 +76,17 @@ py scripts/poll.py comment-instance <instance_code>
 py scripts/poll.py poll
 ```
 
-输出 `{ok, scanned, new, processed, skipped, errors, dry_run}`。
+输出 `{ok, scanned, new, processed, errors, dry_run, approval_codes, approver_user_id}`。
 
-- `processed`:本趟新处理并(默认)已评论的实例,含 `risk_level` / `commented` / `report_file`
-- 评论只写查询日期 / 风险评级 / 风险命中项 +「完整风险信息见附件 Excel」;明细在附件;缺附件则该实例失败、下趟重试
-- `poll --force` 会再查一次企查查并改写已处理实例的原评论
-- `skipped`:已在 `data/state.json` 里处理过,或已不再是 PENDING
-- `errors`:缺字段 / 接口失败等;该实例不写 state,下趟会重试
-- `.env` 设 `FEISHU_COMMENT_DRY_RUN=1` 时只取风险、不写评论、不记 state
+- 扫描对象:预审账号在 `FEISHU_APPROVAL_CODES` 下的**待办任务**(`tasks/query`,`topic=1`),按 `instance_code` 去重
+- `processed`:本趟已 approve 回填的实例,含 `field`/`risk_level`/`rating_text`/`source`/`cost`/`report_file`/`file_code`/`approved`
+- 缓存优先:`FEISHU_CACHE_DAYS`(默认 90)内有记录则复用 MySQL,零成本;未命中先查 dim_company 判自然人(是→回填「自然人无须评估风险」,0 元),是企业才查企查查(约 7.50 元/家)并落库
+- 回填:`tasks/approve` 的 `form` 仅含本节点可编辑的【企业风险评级】文本控件;**低/中/高风险**均写「风险报告附件」控件(整体设值只放报告,申请人误传文件一并删除);未知/自然人/兜底不附报告、但误传过文件则清空;同意后流转给法务
+- `poll --force` 忽略缓存强制重查企查查后再回填 approve
+- `.env` 设 `FEISHU_COMMENT_DRY_RUN=1` 时只取风险、不 approve、不记 state
+- 幂等:approve 后任务从待办消失,天然不重复;approve 失败下趟重试(已查的企业走缓存,不重复计费)
 
-向用户展示时用自然语言摘要:扫了几条、新评论了几条、风险等级各是什么、有无错误。不要直接贴整段 JSON。高风险只作提示,是否继续由审批人判断。
+向用户展示时用自然语言摘要:扫了几条、approve 了几条、风险等级各是什么、有无错误。高风险只作提示,是否继续由审批人判断。
 
 ### 用 zcode loop 定时跑
 
@@ -103,10 +109,19 @@ py scripts/poll.py poll
 - **中风险**:未移出的经营异常、环保处罚、动产抵押/股权出质/清算/欠税/税务非正常/税收违法/司法拍卖/公安通告;近24个月裁判文书且为被告、近24个月开庭公告、近24个月立案且为被告。
 - **低风险**:以上均未命中。
 - **未知**:查无此企业或数据不存在。
+- **自然人**:缓存未命中后查 dim_company 判定(表单信用代码为身份证号,或该行 `source=自然人信息录入申请表单`/代码为身份证号)。自然人**不查企查查、不附报告**。
+
+回填到【企业风险评级】的文本:`高风险，详见风险报告附件` / `中风险，详见风险报告附件` / `低风险` / `未知（未查得风险数据）` / `自然人无须评估风险`;取不到企业时填 `企业名称为空,风险查询接口不适用`(2026-09-04 口径:低/中/高风险均附 Excel 报告到「风险报告附件」控件)。
 
 ## 注意事项
 
-- **不做企业匹配**:表单已有准确企业,直接 `profile`,不要调用 `search` / 886。
-- **计费**:每家约 7.50 元(始终查企查查最新,不走库缓存);幂等保证同一审批实例只查并评论一次。人工查询/缓存复用请用 `legal-company-query`。
-- **数据合规**:企查查数据仅用于内部风控,不得二次分发。快照与 Excel 落在技能内 `data/snapshots/`,查询结果写远程 MySQL,已处理实例记在 `data/state.json`。
+- **不做企业匹配**:表单已有准确企业(外部选项),直接 `profile`,不调 `search`/886。
+- **字段名验收**:新表单上线或改字段名后,先用 `test-instance` 干跑一条真实实例,确认 `companies` 命中正确字段、`located_controls` 命中【企业风险评级】与「附件」控件;字段名配错会导致回填控件定位失败。
+- **回填控件模糊定位**:控件名先精确后模糊匹配(模糊=控件名**完全包含**配置名,配置名 ≥4 字)——`FEISHU_FIELD_ATTACHMENT` 只需配「风险报告附件」稳定前缀,正式部署调整括号内说明不影响定位;控件名缺字或短于配置不匹配,过短配置(如默认「附件」)不做模糊兜底,避免误中「合同附件」。
+- **回填控件须可编辑**:【企业风险评级】与附件目标控件必须在「系统风险预审」节点设为可编辑,否则 `tasks/approve` 的 `form` 写入会被忽略或报错。
+- **控件独占口径(2026-09-04)**:【企业风险评级】与「风险报告附件」只保留本技能写入的内容;申请人误写误传一律删除(误传文件在无报告场景也会清空)。清空若被飞书拒绝,降级为放行+`attachment_warning` 提醒人工删除,不阻塞审批。
+- **计费**:仅缓存未命中且为**企业**时查企查查(约 7.50 元/家);90 天内同企业复用缓存,自然人 0 元。人工查询/缓存复用请用 `legal-company-query`。
+- **审批评论**:同意时评论 `风险预审完成：<评级>，自动放行`(评级=低风险/中风险/高风险/未知（未查得风险数据）/自然人无须评估风险;无企业兜底时为 `风险预审完成，自动放行`)。
+- **报告高亮**:Excel 报告中命中风险的指标行整行黄色高亮(概要区附「高亮说明」图例);登记状态正常存续、三要素一致不高亮。
+- **数据合规**:企查查数据仅用于内部风控,不得二次分发。快照与 Excel 落在技能内 `data/snapshots/`,查询结果写远程 MySQL,已 approve 实例记在 `data/state.json`。
 - **错误处理**:脚本输出 `{ok:false,error}` 时把 `error` 转告用户,不要暴露原始堆栈或密钥。

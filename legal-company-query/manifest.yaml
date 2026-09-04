@@ -2,7 +2,7 @@
 # 安装与配置在 zcode / Cursor / Hermes 三端完全一致,无平台专属步骤。
 
 name: legal-company-query
-version: "1.0.0"
+version: "1.0.1"
 title: 企业风险查询(企查查风险调查)
 status: ga
 rules_version: legal-draft-2026-08-13

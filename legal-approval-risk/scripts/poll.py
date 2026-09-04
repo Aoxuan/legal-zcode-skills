@@ -1,11 +1,20 @@
 # -*- coding: utf-8 -*-
-"""合同审批风险轮询技能入口(zcode / Cursor / Hermes 同一套)。
+"""合同审批风险预审技能入口(zcode / Cursor / Hermes 同一套)。
+
+本技能作为审批流里「系统风险预审」节点的审批人:扫描该员工账号在合同审批定义下
+的待办任务,从表单企业控件(外部选项,值「名称｜信用代码｜法人」)取对方企业三要素,
+先查 MySQL 近 N 天(默认 90)缓存,未命中再调企查查风险接口并落库,生成 Excel 风险
+报告,随后用 tasks/approve 的 form 回填【企业风险评级】文本字段(低/中/高均把 Excel
+报告写入「风险报告附件」专用控件,整体设值只保留报告,申请人误传文件一并删除;
+无报告场景若该控件被误传过文件则清空),并同意放行给法务。
+对方是自然人时(缓存未命中后查 dim_company 判定)不查企查查,回填
+「自然人无须评估风险」。
 
 子命令:
-  check                         体检飞书 + 企查查 + MySQL
-  poll [--force]                扫描 PENDING 合同审批,取风险,评论回实例(文本+Excel,幂等)
-  test-instance <instance_code> 干跑单实例:解析三要素+取风险,不写评论
-  comment-instance <code>       补写/改写一条实例的风险评论(始终查企查查最新)
+  check                         体检飞书 + 企查查 + MySQL + 预审账号
+  poll [--force]                扫描预审账号待办任务,取风险,回填评级(低/中/高附报告)并同意(幂等)
+  test-instance <instance_code> 干跑单实例:解析三要素+定位回填控件+取风险,不 approve
+  process-instance <code>       补处理单条:在预审账号待办里找到该实例并 approve 回填
 
 用法:
   py scripts/poll.py check
@@ -13,14 +22,16 @@
   py scripts/poll.py test-instance 81D31358-93AF-92D6-7425-01A5D67C4E71
 
 输出均为 UTF-8 JSON。错误时打印 {"ok": false, "error": "..."} 并以非零码退出。
-企业已在表单里选定,本技能不做 886 模糊匹配。每次查询企查查最新,约 7.50 元/家。
+企业三要素从表单外部选项控件取出;字段名不固定(对方单位名称/相对方企业名称/
+签约企业名称/达人公司名称),由 FEISHU_FIELD_COMPANY 配置。风险信息库缓存优先
+(默认 90 天),未命中才查企查查最新(约 7.50 元/家)。
 """
 from __future__ import annotations
 
 import json
 import os
 import sys
-import time
+from datetime import datetime
 
 _SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPTS_DIR not in sys.path:
@@ -31,16 +42,27 @@ from common import paths  # noqa: E402
 from common.company_store import store_from_env  # noqa: E402
 from common.snapshot import save as save_snapshot  # noqa: E402
 from common.state import StateStore  # noqa: E402
-from feishu.client import FeishuApiError, FeishuClient, extract_company_fields  # noqa: E402
+from feishu.client import FeishuClient, extract_companies, find_control  # noqa: E402
 from qcc.aggregator import default_aggregator  # noqa: E402
 from qcc.grading import grade_risk  # noqa: E402
 from qcc.report import build_report  # noqa: E402
 
 ACTOR = "legal-approval-risk"
-_LEVEL_ZH = {"low": "低", "medium": "中", "high": "高", "unknown": "未知"}
+_LEVEL_ZH = {"low": "低风险", "medium": "中风险", "high": "高风险"}
+# 低/中/高风险都把 Excel 报告写入「风险报告附件」控件;未知/自然人/兜底不附
+_ATTACH_LEVELS = ("low", "medium", "high")
+_REPORT_HINT = "，详见风险报告附件"
+_UNKNOWN_TEXT = "未知（未查得风险数据）"
+# 对方为自然人(dim_company 判定)时回填的固定文案,不查企查查、不附报告
+_NATURAL_PERSON_RATING = "自然人无须评估风险"
+_FALLBACK_RATING = "企业名称为空,风险查询接口不适用"
 _MYSQL_HINT = (
     "远程 MySQL 为必选:请在技能根目录复制 .env.example 为 .env,"
     "补齐 MYSQL_HOST / MYSQL_PORT / MYSQL_USER / MYSQL_PASSWORD / MYSQL_DB 后再用"
+)
+_APPROVER_HINT = (
+    "预审审批账号缺失:请在审批流新增「系统风险预审」节点(审批人=该员工账号),"
+    "并在 .env 填写 FEISHU_APPROVER_USER_ID(其 open_id,或复用 FEISHU_COMMENT_USER_ID)"
 )
 
 
@@ -104,11 +126,20 @@ def _request_params(code, name, credit_code="", legal_person=""):
     return {"search_key": name}
 
 
-def fetch_or_cache_profile(store, name, credit_code, legal_person, force_refresh=False):
-    """先查 MySQL;未命中再调企查查,落快照+写库+出 Excel。返回 (profile_dict, error)。"""
+def fetch_or_cache_profile(store, name, credit_code, legal_person,
+                            force_refresh=False, cache_days=90):
+    """先查 MySQL 近 cache_days 天缓存;未命中再调企查查,落快照+写库+出 Excel。
+
+    缓存未命中时先判自然人(dim_company):对方为个人则不查企查查,
+    返回 risk_level=natural_person 的 profile(无报告无附件)。
+    返回 (profile_dict, error)。profile_dict 含 report_file(Excel 路径)与 source。
+    """
     if not force_refresh:
         try:
-            cached = store.get_latest(credit_code=credit_code or "", name=name or "")
+            cached = store.get_latest(
+                credit_code=credit_code or "", name=name or "",
+                max_age_days=int(cache_days or 0),
+            )
         except Exception as e:
             return None, "MySQL 读取失败: %s: %s" % (type(e).__name__, e)
         if cached is not None:
@@ -140,6 +171,21 @@ def fetch_or_cache_profile(store, name, credit_code, legal_person, force_refresh
                 "query_date": cached.query_date,
                 "source": "cache",
             }, None
+
+    # 缓存未命中:先判自然人(dim_company),对方为个人不查企查查
+    try:
+        if store.is_natural_person(name, credit_code):
+            return {
+                "name": (name or ""), "credit_code": (credit_code or ""),
+                "legal_person": (legal_person or ""), "status": "",
+                "three_element_ok": None, "risk_level": "natural_person",
+                "hits": [], "called_apis": [], "cost": 0,
+                "snapshot_files": [], "report_file": "",
+                "query_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "source": "natural_person",
+            }, None
+    except Exception as e:
+        return None, "dim_company 自然人判断失败: %s: %s" % (type(e).__name__, e)
 
     agg = default_aggregator(actor=ACTOR)
     try:
@@ -211,113 +257,102 @@ def fetch_or_cache_profile(store, name, credit_code, legal_person, force_refresh
     }, None
 
 
-def _usable_comment_id(raw):
-    s = str(raw or "").strip()
-    if not s or s in ("0", "None"):
+def _rating_label(profile):
+    """短评级标签(审批评论用):低风险/中风险/高风险/未知（未查得风险数据）/
+    自然人无须评估风险。profile 为 None(无企业/缺三要素)时返回 ""。"""
+    if profile is None:
         return ""
-    return s
+    level = profile.get("risk_level")
+    if level == "natural_person":
+        return _NATURAL_PERSON_RATING
+    return _LEVEL_ZH.get(level, _UNKNOWN_TEXT)
 
 
-def format_risk_comment(profile):
-    """审批评论只保留日期、评级、命中项；明细看附件 Excel。"""
-    hits = profile.get("hits") or []
-    hit_lines = []
-    for h in hits[:20]:
-        cat = h.get("category") or ""
-        reason = h.get("reason") or ""
-        count = h.get("count")
-        line = "- %s: %s" % (cat, reason)
-        if count not in (None, ""):
-            line += " (共%s条)" % count
-        hit_lines.append(line)
-    if not hit_lines:
-        hit_lines = ["- 无命中项"]
-    level_zh = _LEVEL_ZH.get(profile.get("risk_level"), profile.get("risk_level") or "未知")
-    return "\n".join([
-        "查询日期：%s" % (profile.get("query_date") or "—"),
-        "风险评级：%s" % level_zh,
-        "风险命中项：",
-        *hit_lines,
-        "",
-        "完整风险信息见附件 Excel",
-    ])
+def _rating_text(profile):
+    """评级文案:高/中风险带「详见风险报告附件」提示;低风险/未知仅评级;
+    自然人→固定文案。profile 为 None(无企业/缺三要素)时返回兜底文案。"""
+    label = _rating_label(profile)
+    if not label:
+        return _FALLBACK_RATING
+    if (profile or {}).get("risk_level") in ("medium", "high"):
+        return label + _REPORT_HINT
+    return label
 
 
-def _comment_text(comment):
-    if not isinstance(comment, dict):
-        return ""
-    content = comment.get("content")
-    if isinstance(content, str):
-        try:
-            content = json.loads(content)
-        except (TypeError, ValueError):
-            return content
-    if isinstance(content, dict):
-        return content.get("text") or ""
-    return ""
+def _find_control_with_fallback(form_items, name_keys, fallback_items=None):
+    """先在实例表单定位控件;未命中再查审批定义表单(空值/后加控件常不出现在实例 form)。"""
+    found = find_control(form_items, name_keys)
+    if found:
+        return found
+    if fallback_items:
+        return find_control(fallback_items, name_keys)
+    return None
 
 
-def find_existing_risk_comment_id(client, instance_code, cfg, fallback=""):
-    cid = _usable_comment_id(fallback)
-    if cid:
-        return cid
-    try:
-        comments = client.list_comments(
-            instance_code,
-            user_id=cfg.get("comment_user_id") or "",
-            user_id_type=cfg.get("comment_user_id_type") or "open_id",
+def _build_approve_form(form_items, cfg, rating_text, file_code, fallback_items=None,
+                        clear_attachment=False):
+    """组装 approve 用的 form:仅含本节点要回填的【企业风险评级】文本控件与「附件」控件。
+
+    两个控件均整体设值,只保留本技能写入的内容(申请人误写/误传一并删除):
+      - 评级控件:value=评级文案(始终写入,覆写申请人误写内容)
+      - 附件控件 attachmentV2:value=[file_code](仅风险报告) ;
+        file_code 为空且 clear_attachment 时 value=[](清空申请人误传文件)。
+    返回 (form_list, located:{rating, attachment})。
+    """
+    form = []
+    located = {}
+    rating_ctl = _find_control_with_fallback(
+        form_items, cfg.get("field_rating") or "企业风险评级", fallback_items,
+    )
+    located["rating"] = rating_ctl
+    if not rating_ctl:
+        raise RuntimeError(
+            "表单未找到【企业风险评级】控件(配置名: %s)" % (cfg.get("field_rating") or "企业风险评级")
         )
-    except Exception:
-        return ""
-    for item in comments:
-        text = _comment_text(item)
-        if (
-            "完整风险信息见附件 Excel" in text
-            or "【签约对象风险预警】" in text
-            or "contract-risk-poll" in text
-        ):
-            return _usable_comment_id(item.get("id") or item.get("comment_id"))
-    return ""
+    form.append({
+        "id": rating_ctl["id"],
+        "type": rating_ctl["type"] or "input",
+        "value": rating_text,
+    })
+    if file_code or clear_attachment:
+        att_ctl = _find_control_with_fallback(
+            form_items, cfg.get("field_attachment") or "附件", fallback_items,
+        )
+        located["attachment"] = att_ctl
+        if att_ctl:
+            form.append({
+                "id": att_ctl["id"],
+                "type": att_ctl["type"] or "attachmentV2",
+                "value": [file_code] if file_code else [],
+            })
+        else:
+            located["attachment_warning"] = (
+                "表单未找到【附件】控件(配置名: %s),已跳过附件回填"
+                % (cfg.get("field_attachment") or "附件")
+            )
+    return form, located
 
 
-def post_risk_comment(client, instance_code, profile, cfg, comment_id=""):
-    """写文本风险评级总结 + 上传 Excel 完整报告作为评论附件。"""
-    report = profile.get("report_file") or ""
-    if not report or not os.path.isfile(report):
-        raise RuntimeError("风险 Excel 未生成,无法写带附件的评论")
-    uploaded = client.upload_approval_file(report)
-    files = [{
-        "url": uploaded["url"],
-        "fileSize": uploaded["fileSize"],
-        "title": uploaded["title"],
-        "type": "attachment",
-    }]
-    text = format_risk_comment(profile)
-    kwargs = dict(
-        user_id=cfg.get("comment_user_id") or "",
-        user_id_type=cfg.get("comment_user_id_type") or "open_id",
-        comment_id=_usable_comment_id(comment_id),
-    )
-    try:
-        return client.add_comment(instance_code, text, files=files, **kwargs)
-    except FeishuApiError:
-        text += "\n附件直链（约12小时有效）：%s" % uploaded["url"]
-        return client.add_comment(instance_code, text, files=None, **kwargs)
+def _attachment_has_value(form_items, cfg):
+    """风险报告附件控件里是否有申请人误传的文件(实例表单值非空)。"""
+    ctl = find_control(form_items, cfg.get("field_attachment") or "附件")
+    if not ctl:
+        return False
+    raw = ctl.get("value")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (ValueError, TypeError):
+            raw = [raw] if raw.strip() else []
+    return any(isinstance(u, str) and u.strip() for u in (raw or []))
 
 
-def _window_ms(days):
-    days = min(max(int(days or 30), 1), 30)
-    end_ms = int(time.time() * 1000)
-    start_ms = end_ms - days * 24 * 60 * 60 * 1000
-    return start_ms, end_ms
-
-
-def _company_from_instance(detail, cfg):
-    company = extract_company_fields(
+def _companies_from_instance(detail, cfg):
+    """按候选字段(如 对方单位名称/相对方企业名称/签约企业名称/达人公司名称)收集表单里已填的企业控件。"""
+    return extract_companies(
         detail.get("form_items") or [],
-        cfg["field_company"],
+        cfg.get("field_companies") or [],
     )
-    return company
 
 
 def cmd_check():
@@ -358,7 +393,8 @@ def cmd_check():
 
 
 def cmd_test_instance(instance_code):
-    ok, rep = check_all()
+    """干跑单实例:解析三要素+定位回填控件+取风险(缓存优先),不 approve、不上传附件。"""
+    ok, rep = check_all(require_approver=False)
     if not ok:
         _emit({"ok": False, "error": _missing_creds_error(rep), "report": _json_report(rep)})
         return 1
@@ -372,101 +408,207 @@ def cmd_test_instance(instance_code):
     except Exception as e:
         _emit({"ok": False, "error": "读取审批实例失败: %s: %s" % (type(e).__name__, e)})
         return 1
-    company = _company_from_instance(detail, cfg)
-    if company["missing"]:
-        _emit({
-            "ok": False,
-            "error": "表单缺少企业字段: %s" % ", ".join(company["missing"]),
-            "instance_code": instance_code,
-            "status": detail.get("status"),
-            "company": company,
-        })
-        return 1
-    profile, err = fetch_or_cache_profile(
-        store, company["name"], company["credit_code"], company["legal_person"],
-        force_refresh=True,
+    form_items = detail.get("form_items") or []
+    companies = _companies_from_instance(detail, cfg)
+    fallback_items = []
+    approval_code = detail.get("approval_code") or ""
+    if approval_code:
+        try:
+            fallback_items = client.get_approval_form(approval_code)
+        except Exception:
+            fallback_items = []
+    rating_ctl = _find_control_with_fallback(
+        form_items, cfg.get("field_rating") or "企业风险评级", fallback_items,
     )
-    if err:
-        _emit({"ok": False, "error": err, "company": company, "instance_code": instance_code})
-        return 1
+    att_ctl = _find_control_with_fallback(
+        form_items, cfg.get("field_attachment") or "附件", fallback_items,
+    )
+    located = {"rating": rating_ctl, "attachment": att_ctl}
+
+    profile = None
+    company = None
+    if not companies or companies[0].get("missing"):
+        rating_text = _FALLBACK_RATING
+        if companies and companies[0].get("missing"):
+            company = companies[0]
+    else:
+        company = companies[0]
+        profile, err = fetch_or_cache_profile(
+            store, company["name"], company["credit_code"], company["legal_person"],
+            force_refresh=False, cache_days=cfg.get("cache_days", 90),
+        )
+        if err:
+            _emit({"ok": False, "error": err, "company": company, "instance_code": instance_code})
+            return 1
+        rating_text = _rating_text(profile)
+
+    # 干跑不上传附件,form 预览只含评级文本;附件展示其定位与「将写入 [file_code]」
+    form_preview, _ = _build_approve_form(
+        form_items, cfg, rating_text, file_code="", fallback_items=fallback_items,
+    )
     _emit({
         "ok": True,
         "instance_code": instance_code,
         "status": detail.get("status"),
+        "companies": [
+            {"field": c.get("field"), "name": c.get("name"), "credit_code": c.get("credit_code")}
+            for c in companies
+        ],
         "company": company,
         "profile": profile,
-        "comment_preview": format_risk_comment(profile),
-        "commented": False,
+        "rating_text": rating_text,
+        "located_controls": {
+            "rating": {k: rating_ctl.get(k) for k in ("id", "type", "name")} if rating_ctl else None,
+            "attachment": {k: att_ctl.get(k) for k in ("id", "type", "name")} if att_ctl else None,
+        },
+        "form_preview": form_preview,
+        "approve": False,
     })
     return 0
 
 
-def _process_one(client, store, state, instance_code, cfg, dry_run, force=False):
-    """处理单实例。返回 (record_or_none, skip_or_none, error_or_none)。"""
-    prev = state.get(instance_code) or {}
-    if not force and state.is_processed(instance_code):
-        return None, {"instance_code": instance_code, "reason": "already_processed"}, None
+def _resolve_risk(store, companies, cfg, force):
+    """从表单企业控件取三要素→缓存优先取风险→生成 Excel。返回 (profile, rating_text, file_code, err)。
+
+    无企业或缺三要素:profile=None、rating=兜底、file_code=""(不附 Excel)。
+    对方为自然人(缓存未命中,dim_company 判定):risk_level=natural_person、rating=固定文案。
+    是否把 Excel 附到「附件」控件由 _process_one 按 _ATTACH_LEVELS 决定(Excel 总会生成)。
+    """
+    if not companies or companies[0].get("missing"):
+        return None, _FALLBACK_RATING, "", None
+    company = companies[0]
+    profile, err = fetch_or_cache_profile(
+        store, company["name"], company["credit_code"], company["legal_person"],
+        force_refresh=force, cache_days=cfg.get("cache_days", 90),
+    )
+    if err:
+        return None, "", "", err
+    return profile, _rating_text(profile), "", None
+
+
+def _process_one(client, store, state, task, cfg, dry_run, force=False):
+    """处理单条预审任务:取风险→回填评级文本(低/中/高风险附 Excel 报告)→同意放行。
+
+    task: {task_id, approval_code, instance_code}。返回 (record_or_none, error_or_none)。
+    两个回填控件只保留本技能写入的内容:评级控件始终覆写;附件控件低/中/高只放报告
+    (申请人误传文件一并删除),未知/自然人/兜底不附报告、但若申请人误传过文件则清空
+    (清空被飞书拒绝时降级放行并记录提醒,不阻塞审批)。
+    """
+    instance_code = task.get("instance_code") or ""
+    task_id = task.get("task_id") or ""
+    approval_code = task.get("approval_code") or ""
     try:
         detail = client.get_instance(instance_code)
     except Exception as e:
-        return None, None, {"instance_code": instance_code, "error": "%s: %s" % (type(e).__name__, e)}
-    status = detail.get("status")
-    if status and status != "PENDING":
-        return None, {"instance_code": instance_code, "reason": "not_pending", "status": status}, None
-    company = _company_from_instance(detail, cfg)
-    if company["missing"]:
-        return None, None, {
-            "instance_code": instance_code,
-            "error": "表单缺少企业字段: %s" % ", ".join(company["missing"]),
-            "company": company,
-        }
-    profile, err = fetch_or_cache_profile(
-        store, company["name"], company["credit_code"], company["legal_person"],
-        force_refresh=True,
-    )
-    if err:
-        return None, None, {"instance_code": instance_code, "error": err, "company": company}
-    # 低/中/高均写评论,不因风险等级跳过;评论=文本评级总结+完整风险 Excel
-    comment_id = ""
-    commented = False
-    if not dry_run:
+        return None, {"instance_code": instance_code,
+                      "error": "读取审批实例失败: %s: %s" % (type(e).__name__, e)}
+    form_items = detail.get("form_items") or []
+    companies = _companies_from_instance(detail, cfg)
+    fallback_items = []
+    if approval_code:
         try:
-            existing = find_existing_risk_comment_id(
-                client, instance_code, cfg, fallback=prev.get("comment_id") or "",
-            )
-            comment_id = post_risk_comment(
-                client, instance_code, profile, cfg, comment_id=existing,
-            ) or existing
-            commented = True
+            fallback_items = client.get_approval_form(approval_code)
+        except Exception:
+            fallback_items = []
+    profile, rating_text, file_code, err = _resolve_risk(store, companies, cfg, force)
+    if err:
+        return None, {"instance_code": instance_code, "error": err,
+                      "company": (companies[0] if companies else None)}
+
+    # 低/中/高风险都上传 Excel 报告,附件控件整体设值只保留报告(申请人误传文件一并删除);
+    # 未知/自然人/兜底不附报告,但申请人若误传过文件则清空该控件
+    attach_note = ""
+    if (profile and profile.get("risk_level") in _ATTACH_LEVELS
+            and profile.get("report_file") and os.path.isfile(profile["report_file"])):
+        try:
+            uploaded = client.upload_approval_file(profile["report_file"])
+            file_code = uploaded.get("code") or ""
         except Exception as e:
-            return None, None, {
-                "instance_code": instance_code,
-                "error": "写评论失败: %s: %s" % (type(e).__name__, e),
-                "company": company,
-                "risk_level": profile.get("risk_level"),
-            }
+            return None, {"instance_code": instance_code,
+                          "error": "上传风险 Excel 失败: %s: %s" % (type(e).__name__, e),
+                          "company": (companies[0] if companies else None)}
+
+    clear_attachment = not file_code and _attachment_has_value(form_items, cfg)
+
+    try:
+        form, located = _build_approve_form(
+            form_items, cfg, rating_text, file_code,
+            fallback_items=fallback_items, clear_attachment=clear_attachment,
+        )
+    except Exception as e:
+        return None, {"instance_code": instance_code,
+                      "error": "%s: %s" % (type(e).__name__, e),
+                      "company": (companies[0] if companies else None)}
+
+    approved = False
+    if not dry_run:
+        label = _rating_label(profile)
+        comment = ("风险预审完成：%s，自动放行" % label) if label else "风险预审完成，自动放行"
+
+        def _approve(f):
+            client.approve_task(
+                approval_code, instance_code, task_id,
+                cfg.get("approver_user_id") or "",
+                f, user_id_type=cfg.get("approver_user_id_type") or "open_id",
+                comment=comment,
+            )
+
+        try:
+            _approve(form)
+            approved = True
+        except Exception as e:
+            error = e
+            if clear_attachment:
+                # 飞书若不接受空附件值,去掉清空条目重试一次:放行优先,清空降级为提醒
+                retry_form = [f for f in form
+                              if not (f.get("type") == "attachmentV2" and f.get("value") == [])]
+                if len(retry_form) != len(form):
+                    try:
+                        _approve(retry_form)
+                        approved = True
+                        attach_note = "申请人误传文件未能清空(飞书拒绝空附件值),已放行,请人工删除"
+                        error = None
+                    except Exception as e2:
+                        error = e2
+            if not approved:
+                return None, {"instance_code": instance_code,
+                              "error": "同意审批任务失败: %s: %s" % (type(error).__name__, error),
+                              "company": (companies[0] if companies else None),
+                              "risk_level": (profile or {}).get("risk_level")}
+
+    rec = {
+        "instance_code": instance_code,
+        "task_id": task_id,
+        "approval_code": approval_code,
+        "field": (companies[0].get("field") if companies else ""),
+        "company": (profile.get("name") if profile else (companies[0].get("name") if companies else "")),
+        "credit_code": (profile.get("credit_code") if profile else (companies[0].get("credit_code") if companies else "")),
+        "risk_level": (profile.get("risk_level") if profile else None),
+        "rating_text": rating_text,
+        "source": (profile.get("source") if profile else ""),
+        "cost": (profile.get("cost") if profile else 0),
+        "report_file": (profile.get("report_file") if profile else ""),
+        "file_code": file_code,
+        "approved": approved,
+        "dry_run": dry_run,
+    }
+    if located.get("attachment_warning"):
+        rec["attachment_warning"] = located["attachment_warning"]
+    if attach_note:
+        rec["attachment_warning"] = attach_note
+
+    if not dry_run and approved:
         state.mark(
             instance_code,
-            risk_level=profile.get("risk_level") or "",
-            comment_id=comment_id or "",
-            company=profile.get("name") or company["name"],
+            risk_level=(profile.get("risk_level") if profile else "unknown"),
+            company=rec.get("company") or "",
+            reason="approved",
         )
-    return {
-        "instance_code": instance_code,
-        "company": profile.get("name") or company["name"],
-        "credit_code": profile.get("credit_code") or company["credit_code"],
-        "risk_level": profile.get("risk_level"),
-        "source": profile.get("source"),
-        "cost": profile.get("cost"),
-        "report_file": profile.get("report_file") or "",
-        "commented": commented,
-        "comment_id": comment_id,
-        "dry_run": dry_run,
-    }, None, None
+    return rec, None
 
 
-def cmd_comment_instance(instance_code):
-    """补写/改写一条实例的风险评论(始终查企查查最新)。"""
+def cmd_process_instance(instance_code):
+    """补处理单条:在预审账号待办里找到该实例并 approve 回填(始终缓存优先,--force 强制重查)。"""
     ok, rep = check_all()
     if not ok:
         _emit({"ok": False, "error": _missing_creds_error(rep), "report": _json_report(rep)})
@@ -475,15 +617,27 @@ def cmd_comment_instance(instance_code):
     if store is None:
         return 1
     cfg = dict(get_feishu())
+    if not cfg.get("approver_user_id"):
+        _emit({"ok": False, "error": _APPROVER_HINT})
+        return 1
     client = FeishuClient(cfg["app_id"], cfg["app_secret"])
-    rec, skip, err = _process_one(
-        client, store, StateStore(), instance_code, cfg, dry_run=False, force=True,
+    try:
+        tasks = client.query_user_tasks(
+            cfg["approver_user_id"], cfg.get("approver_user_id_type") or "open_id", topic="1",
+        )
+    except Exception as e:
+        _emit({"ok": False, "error": "查询预审账号待办失败: %s: %s" % (type(e).__name__, e)})
+        return 1
+    task = next((t for t in tasks if t.get("instance_code") == instance_code), None)
+    if not task:
+        _emit({"ok": False, "error": "该实例不在预审账号的待办任务中(可能已处理或不属于本账号)",
+               "instance_code": instance_code})
+        return 1
+    rec, err = _process_one(
+        client, store, StateStore(), task, cfg, dry_run=False, force=("--force" in sys.argv[2:]),
     )
     if err:
         _emit({"ok": False, **err})
-        return 1
-    if skip:
-        _emit({"ok": False, "error": "无法评论", **skip})
         return 1
     _emit({"ok": True, **rec})
     return 0
@@ -501,35 +655,39 @@ def cmd_poll(force=False):
     if not cfg["approval_codes"]:
         _emit({"ok": False, "error": "FEISHU_APPROVAL_CODES 为空,请填入合同审批定义 code"})
         return 1
+    if not cfg.get("approver_user_id"):
+        _emit({"ok": False, "error": _APPROVER_HINT})
+        return 1
     client = FeishuClient(cfg["app_id"], cfg["app_secret"])
     state = StateStore()
-    start_ms, end_ms = _window_ms(cfg.get("query_window_days"))
-    scanned = []
-    errors = []
-    for code in cfg["approval_codes"]:
-        try:
-            found = client.query_pending_instances(code, start_ms, end_ms)
-        except Exception as e:
-            errors.append({"approval_code": code, "error": "%s: %s" % (type(e).__name__, e)})
-            continue
-        scanned.extend(found)
-    # 去重保持顺序
+    try:
+        tasks = client.query_user_tasks(
+            cfg["approver_user_id"], cfg.get("approver_user_id_type") or "open_id", topic="1",
+        )
+    except Exception as e:
+        _emit({"ok": False, "error": "查询预审账号待办失败: %s: %s" % (type(e).__name__, e)})
+        return 1
+    # 只处理我们关注的合同审批定义,且该任务支持 API 操作
+    codes = set(cfg["approval_codes"])
+    filtered = [
+        t for t in tasks
+        if t.get("approval_code") in codes and t.get("support_api_operate") is not False
+    ]
+    # 同一实例可能多节点都派给该账号;按 instance_code 去重,每趟只处理首个待办
     seen = set()
     unique = []
-    for inst in scanned:
-        if inst in seen:
-            continue
-        seen.add(inst)
-        unique.append(inst)
+    for t in filtered:
+        ic = t.get("instance_code")
+        if ic and ic not in seen:
+            seen.add(ic)
+            unique.append(t)
 
-    processed, skipped = [], []
+    processed, errors = [], []
     dry_run = bool(cfg.get("comment_dry_run"))
-    for inst in unique:
-        rec, skip, err = _process_one(client, store, state, inst, cfg, dry_run, force=force)
+    for task in unique:
+        rec, err = _process_one(client, store, state, task, cfg, dry_run, force=force)
         if rec:
             processed.append(rec)
-        elif skip:
-            skipped.append(skip)
         elif err:
             errors.append(err)
 
@@ -538,10 +696,10 @@ def cmd_poll(force=False):
         "scanned": len(unique),
         "new": len(processed),
         "processed": processed,
-        "skipped": skipped,
         "errors": errors,
         "dry_run": dry_run,
         "approval_codes": cfg["approval_codes"],
+        "approver_user_id": cfg.get("approver_user_id"),
     })
     return 0 if not errors else 1
 
@@ -550,7 +708,7 @@ def main(argv):
     if len(argv) < 2:
         _emit({
             "ok": False,
-            "error": "用法: poll.py check | poll [--force] | test-instance <instance_code> | comment-instance <instance_code>",
+            "error": "用法: poll.py check | poll [--force] | test-instance <instance_code> | process-instance <instance_code>",
         })
         return 1
     sub = argv[1]
@@ -563,11 +721,11 @@ def main(argv):
             _emit({"ok": False, "error": "test-instance 需要 <instance_code>"})
             return 1
         return cmd_test_instance(argv[2])
-    if sub == "comment-instance":
+    if sub == "process-instance":
         if len(argv) < 3:
-            _emit({"ok": False, "error": "comment-instance 需要 <instance_code>"})
+            _emit({"ok": False, "error": "process-instance 需要 <instance_code>"})
             return 1
-        return cmd_comment_instance(argv[2])
+        return cmd_process_instance(argv[2])
     _emit({"ok": False, "error": "未知子命令: %s" % sub})
     return 1
 
