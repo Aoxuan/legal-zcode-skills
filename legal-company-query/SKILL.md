@@ -15,7 +15,7 @@ description: 拉取企业经营信息与风险预警。当用户要查询企业/
 
 1. 探测:Windows 跑 `py --version`,macOS 跑 `python3 --version`。没有命令或不是 3.11 → 停下来,把 [INSTALL.md](INSTALL.md) 交给用户。不要开浏览器下载,也不要在用户未确认时静默安装系统软件。
 2. 把本文件夹放入平台 skills 目录。
-3. 复制 `.env.example` 为 `.env`,填入企查查主账号 `QCC_APP_KEY`/`QCC_SECRET_KEY`(必填) **以及** Monica 账号 `QCC_APP_KEY_MONICA`/`QCC_SECRET_KEY_MONICA`(必填,固定用于 886/2006/887/888/889) **以及** 远程 MySQL `MYSQL_HOST`/`MYSQL_PORT`/`MYSQL_USER`/`MYSQL_PASSWORD`/`MYSQL_DB`(全部必填)。两套企查查 Key 都要,只填一套会查不全。平台环境变量同样生效。
+3. 复制 `.env.example` 为 `.env`,填入企查查 `QCC_APP_KEY`/`QCC_SECRET_KEY`(客户账号,全部接口走这一套) **以及** 远程 MySQL `MYSQL_HOST`/`MYSQL_PORT`/`MYSQL_USER`/`MYSQL_PASSWORD`/`MYSQL_DB`(全部必填)。平台环境变量同样生效。
 4. 安装依赖:`py -m pip install -r requirements.txt`(macOS 用 `python3 -m pip ...`;requests、python-dotenv、openpyxl、pymysql)。
 5. 自检:`py scripts/query.py check`(macOS 用 `python3 scripts/query.py check`;企查查凭据 + MySQL 连通均就绪才算通过)。
 
@@ -33,8 +33,9 @@ description: 拉取企业经营信息与风险预警。当用户要查询企业/
 py scripts/query.py search <企业名>
 ```
 
-输出 JSON:`{ok, keyword, count, candidates:[{index, name, credit_code, legal_person, status}, ...], exact_match, match}`。
+输出 JSON:`{ok, keyword, count, candidates:[{index, name, credit_code, legal_person, status}, ...], exact_match, match, source?}`。
 
+- **本地优先**:若用户给的是工商全称、18 位统一社会信用代码或纳税人识别号,且库内 `legal_company` 维度表恰好精确命中 1 条,则 `count=1, exact_match=true, source="local"`,**不调企查查、不计费**。短词/简称/库内 0 条或同名多条时回退 886 模糊搜索(约 0.10 元/次)。
 - 若 `exact_match == true`:无需让用户选,直接用 `match` 的 `name`/`credit_code`/`legal_person` 进入第 2 步(用户输入的企业名与某候选完全一致,已自动选定)。
 - 若 `count == 0`:告诉用户"未找到匹配「<企业名>」的企业",请用户换个名称再试,结束。
 - 若 `count == 1`:无需让用户选,直接对该候选进入第 2 步(用其 name/credit_code/legal_person)。
@@ -67,7 +68,7 @@ py scripts/query.py profile --refresh "<name>" "<credit_code>" "<legal_person>"
 - **风险等级**:`risk_level` ∈ low/medium/high/unknown,用"低/中/高/未知"表述。
 - **命中项**:逐条列出 `hits` 里的 `category` + `reason`(有 `count` 则附"共 N 条")。
 - **成本提示**:本次 `cost` 元(`cache` 命中为 0;`qcc_live` 约 7.50 元),让用户对计费有感知。
-- **Excel 汇总**:`report_file` 是一份 `qcc_{企业名称}_{时间}.xlsx`,两列(指标名/指标值),已自动落盘到技能内 `data/snapshots/`,并在返回的 `report_file` 中给出完整本地路径。这是本地文件落盘(不是浏览器下载),把路径告知用户,供法务/业务直接打开阅读。
+- **Excel 汇总**:`report_file` 是一份 `qcc_{企业名称}_{时间}.xlsx`,两列(指标名/指标值),已自动落盘到技能内 `data/snapshots/`,并在返回的 `report_file` 中给出完整本地路径。这是本地文件落盘(不是浏览器下载),把路径告知用户,供法务/业务直接打开阅读。报告内命中风险的指标行**整行黄色高亮**(概要区附图例;登记状态存续、三要素一致不高亮),与 legal-approval-risk 同源同口径。
 
 ### 第 2.5 步(可选):脱机重生成 Excel
 
@@ -91,7 +92,7 @@ py scripts/query.py export "<企业名>"
 
 ## 注意事项
 
-- **计费**:每次 `search` 约 0.10 元,每次 `profile` 约 7.50 元(企查查按调用计费)。非必要不重复查同一企业;同一企业短时间内多次询问,优先复用上一次结果而非重跑 profile。
+- **计费**:每次 `search` 约 0.10 元,每次 `profile` 约 7.50 元(企查查按调用计费)。非必要不重复查同一企业;同一企业短时间内多次询问,优先复用上一次结果而非重跑 profile。`search` 命中库内 `legal_company` 维度表精确匹配时 `source="local"`、不计费。
 - **数据合规**:企查查数据仅用于内部风控,不得二次分发;原始 JSON 响应落盘留档到技能内 `data/snapshots/json/`,Excel 汇总与 `_manifest.jsonl` 存 `data/snapshots/`,查询结果必写远程 MySQL。
 - **只读查询**:本技能只查询与展示,不做拦截/放行/签约等动作;高风险仅作为提示,是否继续由法务/业务人工判断。
 - **错误处理**:`query.py` 输出 `{ok:false,error}` 时,把 `error` 用自然语言转告用户,不要暴露原始堆栈。

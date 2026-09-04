@@ -89,26 +89,54 @@ def _split_combo(text):
     return out
 
 
-def extract_company_fields(form_items, company_key):
-    """从「对方企业」那一个控件取三要素。标识可对 id / custom_id / name。
+def _candidate_keys(company_keys):
+    """归一化候选字段名: str 按中英文逗号切分, list/tuple 原样;去空、保序去重。
 
-    当前表单是 radioV2 外部选项: option.key=信用代码, value/text=名称｜代码｜法人。
-    不读「对方负责人」(联系人)。法人缺了由企查查 2006 回填,不算表单缺字段。
-    返回 {name, credit_code, legal_person, missing}。missing 只含 name / credit_code。
+    str 入参的完整原名(去首尾空白)也作为候选——控件名本身可能含逗号,
+    如「风险报告附件（请勿上传文件，由法务AI智能体审批后上传）」,不能只按切分片段匹配。
     """
-    needle = (company_key or "").strip()
-    found = {"name": "", "credit_code": "", "legal_person": ""}
-    if not needle:
-        found["missing"] = ["name", "credit_code"]
-        return found
+    if company_keys is None:
+        return []
+    raw = company_keys if isinstance(company_keys, (list, tuple)) else [company_keys]
+    keys = []
+    for item in raw:
+        for part in str(item).replace("，", ",").split(","):
+            part = part.strip()
+            if part and part not in keys:
+                keys.append(part)
+    if isinstance(company_keys, str):
+        full = company_keys.strip()
+        if full and full not in keys:
+            keys.append(full)
+    return keys
+
+
+def extract_companies(form_items, company_keys):
+    """按候选字段收集表单里已填的企业控件。company_keys 可为 str(逗号分隔)或 list。
+
+    新表单里「签约企业名称」「达人公司名称」都是 radioV2 外部选项:
+    option.key=信用代码, value/text=名称｜代码｜法人。标识可对 id / custom_id / name。
+    控件存在但值为空(被显示条件隐藏/未填)视为未出现,不计入。
+    不读「对方负责人」(联系人)。法人缺了由企查查 2006 回填,不算表单缺字段。
+    返回 [{field, name, credit_code, legal_person, missing}, ...],按表单出现顺序;
+    missing 只含 name / credit_code。
+    """
+    keys = _candidate_keys(company_keys)
+    out = []
+    if not keys:
+        return out
     for item in form_items or []:
         if not isinstance(item, dict):
             continue
-        keys = _item_keys(item)
-        if needle not in keys:
+        item_keys = _item_keys(item)
+        matched = next((k for k in keys if k in item_keys), None)
+        if matched is None:
             continue
         option = item.get("option") if isinstance(item.get("option"), dict) else {}
         raw_val = _normalize_value(item.get("value"))
+        if not raw_val and not _normalize_value(option.get("text")):
+            continue
+        found = {"field": matched, "name": "", "credit_code": "", "legal_person": ""}
         combo = _split_combo(raw_val) or _split_combo(_normalize_value(option.get("text")))
         if combo:
             found["name"] = combo.get("name") or ""
@@ -118,10 +146,17 @@ def extract_company_fields(form_items, company_key):
             found["credit_code"] = str(option.get("key") or "").strip()
         if not found["name"]:
             found["name"] = raw_val
-        break
-    missing = [k for k in ("name", "credit_code") if not found[k]]
-    found["missing"] = missing
-    return found
+        found["missing"] = [k for k in ("name", "credit_code") if not found[k]]
+        out.append(found)
+    return out
+
+
+def extract_company_fields(form_items, company_key):
+    """兼容旧调用:取第一个已填的企业控件,返回单条 {name, credit_code, legal_person, missing}。"""
+    companies = extract_companies(form_items, company_key)
+    if companies:
+        return companies[0]
+    return {"name": "", "credit_code": "", "legal_person": "", "missing": ["name", "credit_code"]}
 
 
 class FeishuClient:
@@ -208,6 +243,22 @@ class FeishuClient:
         detail["form_items"] = parse_form(detail.get("form"))
         return detail
 
+    @audited("feishu.get_approval_form")
+    def get_approval_form(self, approval_code):
+        """GET /approval/v4/approvals/:approval_code,返回定义表单控件数组。
+
+        实例详情里空值/后加的控件可能不出现;回填【企业风险评级】时用定义里的 id/type 兜底。
+        """
+        data = self._json(
+            "获取审批定义", "GET",
+            BASE + "/approval/v4/approvals/%s" % approval_code,
+        )
+        body = data.get("data") or {}
+        form = body.get("form")
+        if isinstance(form, dict):
+            form = form.get("form_content") or form.get("widgets") or form
+        return parse_form(form)
+
     @audited("feishu.upload_approval_file")
     def upload_approval_file(self, file_path, file_name=None):
         """上传审批附件,返回 {url, fileSize, title, type, code}。url 约 12 小时有效。"""
@@ -276,3 +327,119 @@ class FeishuClient:
         )
         body = data.get("data") or {}
         return body.get("comments") or body.get("items") or []
+
+    @audited("feishu.query_user_tasks")
+    def query_user_tasks(self, user_id, user_id_type="open_id", topic="1", page_size=100):
+        """GET /approval/v4/tasks/query。返回该账号待办任务列表(topic=1 待办审批)。
+
+        每项归一为 {task_id, approval_code, instance_code, status, support_api_operate}。
+        需权限 approval:task:list_by_user(或 approval:approval:readonly),tenant_access_token 可用。
+        """
+        out = []
+        page_token = ""
+        while True:
+            params = {
+                "user_id": user_id,
+                "user_id_type": user_id_type or "open_id",
+                "topic": topic or "1",
+                "page_size": int(page_size),
+            }
+            if page_token:
+                params["page_token"] = page_token
+            data = self._json(
+                "查询用户待办任务", "GET",
+                BASE + "/approval/v4/tasks/query",
+                params=params,
+            )
+            body = data.get("data") or {}
+            for t in body.get("tasks") or []:
+                if not isinstance(t, dict):
+                    continue
+                # tasks/query 字段名与 search/approve 不同:
+                # definition_code=审批定义, process_code=实例, task_id=任务
+                out.append({
+                    "task_id": str(t.get("task_id") or t.get("id") or ""),
+                    "approval_code": t.get("definition_code") or t.get("approval_code") or "",
+                    "instance_code": t.get("process_code") or t.get("instance_code") or "",
+                    "status": t.get("status") or "",
+                    "support_api_operate": t.get("support_api_operate"),
+                    "title": t.get("title") or t.get("definition_name") or "",
+                })
+            if not body.get("has_more"):
+                break
+            page_token = body.get("page_token") or ""
+            if not page_token:
+                break
+        return out
+
+    @audited("feishu.approve_task")
+    def approve_task(self, approval_code, instance_code, task_id, user_id,
+                     form, user_id_type="open_id", comment=""):
+        """POST /approval/v4/tasks/approve。同意任务并按 form 回填可编辑控件。
+
+        form:控件值 JSON 数组(仅含本节点要回填的可编辑控件),如
+          [{"id":"widget...","type":"input","value":"高"},
+           {"id":"widget...","type":"attachmentV2","value":["<file_code>"]}]
+        传字符串化 JSON。需权限 approval:task,tenant_access_token 可用;
+        user_id 必须是该任务的审批人。
+        """
+        params = {"user_id_type": user_id_type or "open_id"}
+        payload = {
+            "approval_code": approval_code,
+            "instance_code": instance_code,
+            "task_id": task_id,
+            "user_id": user_id,
+        }
+        if comment:
+            payload["comment"] = comment
+        if form:
+            payload["form"] = json.dumps(form, ensure_ascii=False)
+        data = self._json(
+            "同意审批任务", "POST",
+            BASE + "/approval/v4/tasks/approve",
+            params=params, json=payload,
+        )
+        return data.get("data") or {}
+
+
+def find_control(form_items, name_keys):
+    """在表单控件里按名称(或 widget id)定位控件,返回首个命中项 {id, type, name, value}。
+
+    name_keys 可为 str(逗号分隔)或 list;按顺序匹配控件的 name / id / custom_id。
+    先精确(相等)后模糊:精确未命中时,取首个**完全包含候选**(控件名 ⊇ 候选,候选 >=4 字)
+    的控件。用于控件名带说明后缀的场景,如「风险报告附件（请勿上传文件，由…上传）」
+    改说明不影响定位;控件名比配置短或缺字(如「风险报告附」)不匹配,过短候选
+    (如默认「附件」)不做模糊兜底,避免误中「合同附件」。
+    """
+    keys = _candidate_keys(name_keys)
+    # 第一轮:精确相等
+    for item in form_items or []:
+        if not isinstance(item, dict):
+            continue
+        item_keys = _item_keys(item)
+        matched = next((k for k in keys if k in item_keys), None)
+        if matched is None:
+            continue
+        return {
+            "id": str(item.get("id") or ""),
+            "type": item.get("type") or "",
+            "name": item.get("name") or matched,
+            "value": item.get("value"),
+        }
+    # 第二轮:模糊——控件名完全包含候选(候选>=4字),不做反向包含
+    for item in form_items or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "")
+        if not name:
+            continue
+        matched = next((k for k in keys if k and len(k) >= 4 and k in name), None)
+        if matched is None:
+            continue
+        return {
+            "id": str(item.get("id") or ""),
+            "type": item.get("type") or "",
+            "name": item.get("name") or matched,
+            "value": item.get("value"),
+        }
+    return None

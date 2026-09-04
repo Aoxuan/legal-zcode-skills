@@ -140,6 +140,31 @@ def cmd_check():
 def cmd_search(keyword):
     if not _require_qcc():
         return 1
+    # 先读 legal_company 维度表精确匹配(名称/信用代码/税号):恰好 1 条则不调 886,省计费。
+    try:
+        store = store_from_env()
+    except Exception:
+        store = None
+    if store is not None:
+        try:
+            local = store.find_exact(keyword)
+        except Exception:
+            local = None
+        if local is not None:
+            cand_json = [{
+                "index": 1, "name": local.name, "credit_code": local.credit_code,
+                "legal_person": local.legal_person, "status": local.status,
+            }]
+            _emit({
+                "ok": True,
+                "keyword": keyword,
+                "count": 1,
+                "candidates": cand_json,
+                "exact_match": True,
+                "match": cand_json[0],
+                "source": "local",
+            })
+            return 0
     agg = default_aggregator(actor=ACTOR)
     try:
         candidates = agg.search_candidates(keyword)
@@ -149,7 +174,7 @@ def cmd_search(keyword):
     cand_json = [
         {"index": i, "name": c.name, "credit_code": c.credit_code,
          "legal_person": c.legal_person, "status": c.status}
-        for i, c in enumerate(candidates)
+        for i, c in enumerate(candidates, 1)
     ]
     match = find_exact_match(candidates, keyword)
     match_json = None

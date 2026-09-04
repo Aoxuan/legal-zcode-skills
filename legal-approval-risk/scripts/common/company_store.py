@@ -5,13 +5,57 @@
 """
 from __future__ import annotations
 import json
+import re
 from typing import List, Optional
 
-from qcc.aggregator import CompanyProfile
+from qcc.aggregator import Candidate, CompanyProfile
+
+# legal-person-poll 写入自然人行的 source 标记(dim_company 共表)
+_PERSON_SOURCE = "自然人信息录入申请表单"
+_ID15_RE = re.compile(r"^[1-8]\d{14}$")
+_ID18_RE = re.compile(r"^[1-8]\d{16}[\dX]$")
+_ID_WEIGHTS = (7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2)
+_ID_CHECK_MAP = "10X98765432"
+
+
+def _is_id_number(value) -> bool:
+    """中国大陆身份证号:15位(老版),或18位且校验位合法(末位 X 计入)。
+
+    首位限 1-8(身份证省级行政区划码 11-82),排除统一社会信用代码(企业多以为 9 开头)。
+    """
+    v = (value or "").strip().upper() if isinstance(value, str) else ""
+    if not v:
+        return False
+    if _ID15_RE.match(v):
+        return True
+    if not _ID18_RE.match(v):
+        return False
+    s = sum(int(c) * w for c, w in zip(v[:17], _ID_WEIGHTS))
+    return _ID_CHECK_MAP[s % 11] == v[17]
+
+# 企业主数据维度表:身份查找(名称/信用代码/税号)本地精确匹配用。
+DIM_DDL = """
+CREATE TABLE IF NOT EXISTS `dim_company` (
+  id BIGINT NOT NULL AUTO_INCREMENT,
+  company_name VARCHAR(255) NOT NULL,
+  credit_code VARCHAR(32) NOT NULL,
+  tax_no VARCHAR(32) NOT NULL,
+  legal_person VARCHAR(128) NOT NULL DEFAULT '',
+  contact_name VARCHAR(128) NULL,
+  contact_phone VARCHAR(32) NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_credit_code (credit_code),
+  UNIQUE KEY uk_tax_no (tax_no),
+  KEY idx_company_name (company_name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+"""
 
 DDL = """
 CREATE TABLE IF NOT EXISTS `{table}` (
   id BIGINT NOT NULL AUTO_INCREMENT,
+  company_id BIGINT NULL,
   credit_code VARCHAR(32) NOT NULL DEFAULT '',
   company_name VARCHAR(255) NOT NULL,
   legal_person VARCHAR(128) NOT NULL DEFAULT '',
@@ -28,9 +72,23 @@ CREATE TABLE IF NOT EXISTS `{table}` (
   contract_id VARCHAR(128) NOT NULL DEFAULT '',
   PRIMARY KEY (id),
   KEY idx_credit_date (credit_code, query_date),
-  KEY idx_name (company_name)
+  KEY idx_name (company_name),
+  KEY idx_company_id (company_id),
+  CONSTRAINT fk_query_company FOREIGN KEY (company_id) REFERENCES dim_company(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """
+
+
+def _tax_no_from_payloads(payloads, credit_code=""):
+    """从 2006 原始响应取 TaxNo;取不到回退 credit_code(占位,满足 NOT NULL)。"""
+    try:
+        data = (payloads or {}).get(2006) or {}
+        tax = ((data.get("Result") or {}).get("Data") or {}).get("TaxNo")
+        if tax and str(tax).strip():
+            return str(tax).strip()
+    except (AttributeError, TypeError):
+        pass
+    return credit_code or ""
 
 
 def _three_to_sql(v):
@@ -45,6 +103,14 @@ def _three_from_sql(v):
     if v is None:
         return None
     return bool(int(v))
+
+
+def _cutoff_str(max_age_days):
+    """返回 max_age_days 天前的本地时间字符串(YYYY-MM-DD HH:MM:SS),用于内存库过滤;<=0 返回 ''。"""
+    if not max_age_days or max_age_days <= 0:
+        return ""
+    from datetime import datetime, timedelta
+    return (datetime.now() - timedelta(days=int(max_age_days))).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _payloads_from_json(raw) -> dict:
@@ -91,11 +157,18 @@ class NullCompanyStore:
     def search(self, keyword: str, limit: int = 5) -> List[CompanyProfile]:
         return []
 
-    def get_latest(self, credit_code: str = "", name: str = "") -> Optional[CompanyProfile]:
+    def find_exact(self, keyword: str) -> Optional[Candidate]:
+        return None
+
+    def get_latest(self, credit_code: str = "", name: str = "",
+                   max_age_days: int = 0) -> Optional[CompanyProfile]:
         return None
 
     def insert(self, profile: CompanyProfile, actor: str = "", contract_id: str = "") -> None:
         return None
+
+    def is_natural_person(self, name: str = "", credit_code: str = "") -> bool:
+        return _is_id_number(credit_code)
 
 
 class MemoryCompanyStore:
@@ -103,6 +176,8 @@ class MemoryCompanyStore:
 
     def __init__(self):
         self.rows: List[CompanyProfile] = []
+        self.companies: List[dict] = []  # 维度表: {id,name,credit_code,tax_no,legal_person}
+        self._next_id = 1
 
     def search(self, keyword: str, limit: int = 5) -> List[CompanyProfile]:
         kw = (keyword or "").strip().lower()
@@ -119,22 +194,81 @@ class MemoryCompanyStore:
         out.sort(key=lambda x: x.query_date or "", reverse=True)
         return out[:limit]
 
-    def get_latest(self, credit_code: str = "", name: str = "") -> Optional[CompanyProfile]:
+    def find_exact(self, keyword: str) -> Optional[Candidate]:
+        kw = (keyword or "").strip()
+        if not kw:
+            return None
         hits = []
+        for c in self.companies:
+            if c["company_name"] == kw or c["credit_code"] == kw or c["tax_no"] == kw:
+                hits.append(c)
+        if len(hits) != 1:
+            return None
+        c = hits[0]
+        return Candidate(name=c["company_name"], credit_code=c["credit_code"],
+                         legal_person=c["legal_person"], status="")
+
+    def get_latest(self, credit_code: str = "", name: str = "",
+                   max_age_days: int = 0) -> Optional[CompanyProfile]:
+        hits = []
+        cutoff = _cutoff_str(max_age_days)
         for p in self.rows:
             if credit_code and p.credit_code == credit_code:
                 hits.append(p)
-            elif name and p.name == name:
+            elif name and not credit_code and p.name == name:
                 hits.append(p)
         if not hits:
             return None
+        if cutoff:
+            hits = [p for p in hits if (p.query_date or "") >= cutoff]
+            if not hits:
+                return None
         hits.sort(key=lambda x: x.query_date or "", reverse=True)
         p = hits[0]
         p.source = "cache"
         return p
 
+    def _upsert_company(self, profile: CompanyProfile) -> Optional[int]:
+        cc = (profile.credit_code or "").strip()
+        if not cc:
+            return None
+        tax = _tax_no_from_payloads(profile.payloads, cc)
+        for c in self.companies:
+            if c["credit_code"] == cc:
+                c["company_name"] = profile.name or c["company_name"]
+                c["legal_person"] = profile.legal_person or c["legal_person"]
+                if tax:
+                    c["tax_no"] = tax
+                return c["id"]
+        cid = self._next_id
+        self._next_id += 1
+        self.companies.append({
+            "id": cid, "company_name": profile.name or "", "credit_code": cc,
+            "tax_no": tax, "legal_person": profile.legal_person or "",
+        })
+        return cid
+
     def insert(self, profile: CompanyProfile, actor: str = "", contract_id: str = "") -> None:
+        company_id = self._upsert_company(profile)
+        profile.company_id = company_id  # type: ignore[attr-defined]
         self.rows.append(profile)
+
+    def is_natural_person(self, name: str = "", credit_code: str = "") -> bool:
+        """表单信用代码本身是身份证号,或维度表该名称/代码行是自然人(source 标记/代码为身份证号)。"""
+        if _is_id_number(credit_code):
+            return True
+        kw_code = (credit_code or "").strip()
+        kw_name = (name or "").strip()
+        for c in self.companies:
+            hit = (kw_code and c.get("credit_code") == kw_code) or \
+                  (kw_name and c.get("company_name") == kw_name)
+            if not hit:
+                continue
+            if c.get("source") == _PERSON_SOURCE:
+                return True
+            if _is_id_number(c.get("credit_code")) or _is_id_number(c.get("tax_no")):
+                return True
+        return False
 
 
 class MysqlCompanyStore:
@@ -160,10 +294,33 @@ class MysqlCompanyStore:
         conn = self._connect()
         try:
             with conn.cursor() as cur:
+                cur.execute(DIM_DDL)
                 cur.execute(DDL.format(table=self.table.replace("`", "")))
             conn.commit()
         finally:
             conn.close()
+
+    def find_exact(self, keyword: str) -> Optional[Candidate]:
+        """维度表精确匹配:名称/信用代码/税号 任一相等。恰好 1 条返回候选,否则 None。"""
+        kw = (keyword or "").strip()
+        if not kw:
+            return None
+        sql = (
+            "SELECT company_name, credit_code, legal_person FROM `dim_company` "
+            "WHERE company_name=%s OR credit_code=%s OR tax_no=%s"
+        )
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, (kw, kw, kw))
+                rows = cur.fetchall() or []
+        finally:
+            conn.close()
+        if len(rows) != 1:
+            return None
+        r = rows[0]
+        return Candidate(name=r["company_name"], credit_code=r["credit_code"],
+                         legal_person=r["legal_person"], status="")
 
     def search(self, keyword: str, limit: int = 5) -> List[CompanyProfile]:
         kw = (keyword or "").strip()
@@ -190,15 +347,23 @@ class MysqlCompanyStore:
             conn.close()
         return [profile_from_row(r) for r in rows]
 
-    def get_latest(self, credit_code: str = "", name: str = "") -> Optional[CompanyProfile]:
+    def get_latest(self, credit_code: str = "", name: str = "",
+                   max_age_days: int = 0) -> Optional[CompanyProfile]:
+        where_age = ""
+        args_extra = ()
+        if max_age_days and max_age_days > 0:
+            where_age = " AND query_date >= DATE_SUB(NOW(), INTERVAL %s DAY)"
+            args_extra = (int(max_age_days),)
         if credit_code:
-            sql = ("SELECT * FROM `{table}` WHERE credit_code=%s "
-                   "ORDER BY query_date DESC LIMIT 1").format(table=self.table.replace("`", ""))
-            args = (credit_code,)
+            sql = ("SELECT * FROM `{table}` WHERE credit_code=%s{where_age} "
+                   "ORDER BY query_date DESC LIMIT 1").format(
+                       table=self.table.replace("`", ""), where_age=where_age)
+            args = (credit_code,) + args_extra
         elif name:
-            sql = ("SELECT * FROM `{table}` WHERE company_name=%s "
-                   "ORDER BY query_date DESC LIMIT 1").format(table=self.table.replace("`", ""))
-            args = (name,)
+            sql = ("SELECT * FROM `{table}` WHERE company_name=%s{where_age} "
+                   "ORDER BY query_date DESC LIMIT 1").format(
+                       table=self.table.replace("`", ""), where_age=where_age)
+            args = (name,) + args_extra
         else:
             return None
         conn = self._connect()
@@ -210,17 +375,96 @@ class MysqlCompanyStore:
             conn.close()
         return profile_from_row(row) if row else None
 
+    def is_natural_person(self, name: str = "", credit_code: str = "") -> bool:
+        """自然人判定(缓存未命中后、查企查查前调用)。
+
+        ① 表单信用代码本身是身份证号(外部选项对自然人回填身份证号) → 是;
+        ② dim_company 中该名称/信用代码/税号对应行:source 为自然人录入标记,
+          或其 credit_code/tax_no 形如身份证号 → 是。其余 → 否(走企查查)。
+        source 列由 legal-person-poll 的 DDL/ALTER 添加;裸表(无该列)时降级只做格式判断。
+        """
+        if _is_id_number(credit_code):
+            return True
+        kw_code = (credit_code or "").strip()
+        kw_name = (name or "").strip()
+        if not kw_code and not kw_name:
+            return False
+        conds, args = [], []
+        if kw_code:
+            conds += ["credit_code=%s", "tax_no=%s"]
+            args += [kw_code, kw_code]
+        if kw_name:
+            conds.append("company_name=%s")
+            args.append(kw_name)
+        where = " OR ".join(conds)
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                rows = None
+                try:
+                    cur.execute(
+                        "SELECT credit_code, tax_no, source FROM `dim_company` WHERE %s LIMIT 5" % where,
+                        args,
+                    )
+                    rows = cur.fetchall() or []
+                except Exception as e:
+                    if "Unknown column" not in str(e):
+                        raise
+                    cur.execute(
+                        "SELECT credit_code, tax_no FROM `dim_company` WHERE %s LIMIT 5" % where,
+                        args,
+                    )
+                    rows = [{"credit_code": r["credit_code"], "tax_no": r["tax_no"], "source": ""}
+                            for r in (cur.fetchall() or [])]
+        finally:
+            conn.close()
+        for r in rows or []:
+            if (r.get("source") or "") == _PERSON_SOURCE:
+                return True
+            if _is_id_number(r.get("credit_code")) or _is_id_number(r.get("tax_no")):
+                return True
+        return False
+
+    def _upsert_company(self, profile: CompanyProfile) -> Optional[int]:
+        """按 credit_code upsert 维度表,返回 company_id。信用代码为空返回 None。"""
+        cc = (profile.credit_code or "").strip()
+        if not cc:
+            return None
+        tax = _tax_no_from_payloads(profile.payloads, cc)
+        upsert = (
+            "INSERT INTO `dim_company` (company_name, credit_code, tax_no, legal_person) "
+            "VALUES (%s,%s,%s,%s) "
+            "ON DUPLICATE KEY UPDATE "
+            "company_name=VALUES(company_name), legal_person=VALUES(legal_person), "
+            "tax_no=IF(VALUES(tax_no)<>'',VALUES(tax_no),dim_company.tax_no)"
+        )
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(upsert, (profile.name or "", cc, tax, profile.legal_person or ""))
+                company_id = cur.lastrowid
+                if not company_id:  # ON DUPLICATE 命中更新时 lastrowid=0,回查
+                    cur.execute("SELECT id FROM `dim_company` WHERE credit_code=%s", (cc,))
+                    row = cur.fetchone()
+                    company_id = row["id"] if row else None
+            conn.commit()
+        finally:
+            conn.close()
+        return company_id
+
     def insert(self, profile: CompanyProfile, actor: str = "", contract_id: str = "") -> None:
+        company_id = self._upsert_company(profile)
         payloads = {str(k): v for k, v in (profile.payloads or {}).items()}
         sql = (
-            "INSERT INTO `{table}` (credit_code, company_name, legal_person, status, query_date, "
+            "INSERT INTO `{table}` (company_id, credit_code, company_name, legal_person, status, query_date, "
             "risk_level, three_element_ok, hits_json, payloads_json, called_apis, cost, source, "
-            "actor, contract_id) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+            "actor, contract_id) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
         ).format(table=self.table.replace("`", ""))
         conn = self._connect()
         try:
             with conn.cursor() as cur:
                 cur.execute(sql, (
+                    company_id,
                     profile.credit_code or "",
                     profile.name or "",
                     profile.legal_person or "",

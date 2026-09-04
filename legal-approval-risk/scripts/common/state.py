@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """已处理审批实例的幂等状态(本地 JSON)。
 
-结构: {instance_code: {processed_at, risk_level, comment_id, company}}
+结构: {instance_code: {processed_at, risk_level, comment_id, company, reason?}}
 poll 只处理本文件中不存在的 instance_code;评论成功后再写入,避免重复评论/计费。
+reason 用于区分处理方式,当前只有 no_company_field(表单没出现企业字段,跳过不查)。
 """
 from __future__ import annotations
 
@@ -43,12 +44,15 @@ class StateStore:
     def get(self, instance_code):
         return self._data.get(instance_code)
 
-    def mark(self, instance_code, risk_level="", comment_id="", company=""):
-        self._data[instance_code] = {
+    def mark(self, instance_code, risk_level="", comment_id="", company="", reason=""):
+        record = {
             "processed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "risk_level": risk_level or "",
             "comment_id": comment_id or "",
             "company": company or "",
         }
+        if reason:
+            record["reason"] = reason
+        self._data[instance_code] = record
         self._save()
         return self._data[instance_code]
