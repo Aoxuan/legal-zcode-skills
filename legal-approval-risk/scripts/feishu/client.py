@@ -285,6 +285,17 @@ class FeishuClient:
             "type": "attachment",
         }
 
+    def download(self, url):
+        """下载审批附件(实例 form 里的直链,约 12 小时有效),返回 bytes。
+
+        直链无需鉴权头;\\u0026 须还原成 &(与 legal-ledger-entry 同口径,
+        见 01-poc/飞书OpenAPI对接速查.md §1)。用于合同 Word 主体校验。
+        """
+        clean = (url or "").replace("\\u0026", "&")
+        resp = requests.get(clean, timeout=120)
+        resp.raise_for_status()
+        return resp.content
+
     @audited("feishu.add_comment")
     def add_comment(self, instance_code, content, user_id="", user_id_type="open_id",
                     comment_id="", files=None):
@@ -397,6 +408,32 @@ class FeishuClient:
         data = self._json(
             "同意审批任务", "POST",
             BASE + "/approval/v4/tasks/approve",
+            params=params, json=payload,
+        )
+        return data.get("data") or {}
+
+    @audited("feishu.reject_task")
+    def reject_task(self, approval_code, instance_code, task_id, user_id,
+                    user_id_type="open_id", comment=""):
+        """POST /approval/v4/tasks/reject。拒绝任务(合同主体不一致退回业务修改)。
+
+        与 approve 不同:reject **不支持 form 回填控件值**,原因只能写 comment;
+        飞书会自动向发起人推送拒绝通知。拒绝后任务从待办消失(幂等)。
+        需权限 approval:task(已含),tenant_access_token 可用;
+        user_id 必须是该任务的审批人。
+        """
+        params = {"user_id_type": user_id_type or "open_id"}
+        payload = {
+            "approval_code": approval_code,
+            "instance_code": instance_code,
+            "task_id": task_id,
+            "user_id": user_id,
+        }
+        if comment:
+            payload["comment"] = comment
+        data = self._json(
+            "拒绝审批任务", "POST",
+            BASE + "/approval/v4/tasks/reject",
             params=params, json=payload,
         )
         return data.get("data") or {}
