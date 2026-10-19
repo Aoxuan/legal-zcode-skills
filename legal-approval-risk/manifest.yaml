@@ -2,8 +2,8 @@
 # 安装与配置在 zcode / Cursor / Hermes 三端完全一致,无平台专属步骤。
 
 name: legal-approval-risk
-version: "2.4.0"
-title: 合同审批风险预审(预审节点回填评级,低/中/高均附报告,自然人免查,放行)
+version: "3.0.0"
+title: 合同审批风险预审(合同主体一致性校验+回填评级,不一致拒绝退回;低/中/高均附报告,自然人/无企业免查放行)
 status: ga
 rules_version: legal-draft-2026-08-13
 
@@ -16,7 +16,7 @@ entry:
       desc: 体检飞书 app 凭证 + 审批定义 + 企查查 + 远程 MySQL + 预审账号
     poll:
       args: []
-      desc: 扫描预审账号待办任务,缓存优先取风险,回填评级(低/中/高均附 Excel 报告到「风险报告附件」控件)并同意放行(幂等,缓存未命中约 7.50 元/家)
+      desc: 扫描预审账号待办任务,先做合同主体一致性校验(下载合同附件解析签约对方,统一按「签约主体」排除法;不一致 tasks/reject 拒绝退回零计费,无法核验放行提醒人工核对),一致才缓存优先取风险,回填评级(低/中/高均附 Excel 报告到「风险报告附件」控件)并同意放行(幂等,缓存未命中约 7.50 元/家;已预审实例的人工节点待办跳过不代签);实例表单无任何企业控件(如达人解约)免扫描直接放行,回填「无须风险扫描（无合作企业）」,0 元
     test-instance:
       args: [instance_code]
       desc: 干跑单实例,解析三要素+定位回填控件+取风险,不 approve
@@ -37,6 +37,7 @@ outputs:
   scanned: int
   new: int
   processed: list
+  skipped_processed: list
   errors: list
   profile:
     name: string
@@ -44,7 +45,7 @@ outputs:
     legal_person: string
     status: string
     three_element_ok: bool|null
-    risk_level: enum[low, medium, high, unknown, natural_person]
+    risk_level: enum[low, medium, high, unknown, natural_person, exempt, subject_mismatch, subject_unverified]
     hits: list
     cost: float
     source: string
@@ -58,14 +59,16 @@ depends:
   - 回填控件名(FEISHU_FIELD_RATING 默认 企业风险评级;FEISHU_FIELD_ATTACHMENT 当前指向「风险报告附件」专用控件——两控件只保留技能写入内容:低/中/高只放报告(申请人误传文件一并删除),无报告场景误传文件清空,清空被飞书拒绝时降级放行并提醒;控件定位先精确后模糊(控件名须完全包含配置名且配置名>=4字),配稳定前缀即可,括号说明调整不影响)
   - 缓存窗口(FEISHU_CACHE_DAYS 默认 90)
   - 自然人判定:缓存未命中后查 dim_company(表单信用代码为身份证号,或该行 source=自然人信息录入申请表单),是自然人则回填「自然人无须评估风险」,不查企查查不附报告
-  - 企查查主账号(QCC_APP_KEY / QCC_SECRET_KEY):856/739;缺 Monica 时回退用于 886/2006/887/888/889
-  - 企查查 Monica 账号(QCC_APP_KEY_MONICA / QCC_SECRET_KEY_MONICA):固定用于 886/2006/887/888/889;两套都填,只填一套会查不全
+  - 免扫描直接放行(2026-09-08 口径):实例表单无任何企业控件(如达人解约/达人签约且「是否涉及达人公司」=否,企业控件为条件显示)→不查企查查/不判自然人,回填「无须风险扫描（无合作企业）」(实例与定义表单都定位不到评级控件时仅评论放行),误传过文件仍清空附件控件
+  - 企查查客户账号(QCC_APP_KEY / QCC_SECRET_KEY):全部接口(886/2006/856/739/887/888/889)走这一套,单账号口径
+  - 合同主体校验(FEISHU_SUBJECT_CHECK 默认开,0=关闭;FEISHU_FIELD_CONTRACT_ATTACH 默认「合同附件」;FEISHU_FIELD_OUR_ENTITY 默认「签约主体」):附件支持 docx/旧版 .doc(UTF-16LE)/文本型 PDF(pdfplumber),扫描件与图片走人工核对兜底;依赖 python-docx>=1.1 与 pdfplumber
   - 远程 MySQL(MYSQL_HOST / MYSQL_PORT / MYSQL_USER / MYSQL_PASSWORD / MYSQL_DB):必写 legal_company_query,与 legal-person-poll 共库(dim_company 自然人共表)
 
 reuse:
   - scripts/qcc/  # 与 legal-company-query / 01-poc 同源(风险分级与报告口径一致)
   - scripts/common/  # 同上
-  - scripts/feishu/client.py  # 本技能新增待办查询/同意任务/控件(先精确后模糊)定位
+  - scripts/feishu/client.py  # 本技能新增待办查询/同意与拒绝任务/控件(先精确后模糊)定位/附件下载
+  - scripts/common/contract_subject.py  # 合同主体解析与排除法甄别(2026-10-19 新增,本技能独有)
 
 # 三端安装配置完全一致;定时由宿主 loop/任务计划触发,技能本身是无状态的一趟扫描
 packaging: |

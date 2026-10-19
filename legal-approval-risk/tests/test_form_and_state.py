@@ -29,9 +29,12 @@ def _form_with_company():
 
 
 def _cfg():
+    # subject_check_enabled=False:本文件是旧口径(不校验合同主体)的回归用例;
+    # 新口径(校验/拒绝/兜底)见 test_subject_check.py
     return {"field_companies": _FIELDS, "field_rating": "企业风险评级",
             "field_attachment": "附件", "approver_user_id": "ou_test",
-            "approver_user_id_type": "open_id", "cache_days": 90}
+            "approver_user_id_type": "open_id", "cache_days": 90,
+            "subject_check_enabled": False}
 
 
 def _profile(level="low", source="cache"):
@@ -352,7 +355,8 @@ class ProcessOneTests(unittest.TestCase):
         self.assertTrue(any(f["id"] == "a1" and f["value"] == [] for f in first_form))
         self.assertFalse(any(f["id"] == "a1" for f in second_form))
 
-    def test_no_company_approves_with_fallback(self):
+    def test_no_company_exempt_release(self):
+        """实例表单无企业控件(如达人解约):免扫描直接放行,回填「无须风险扫描（无合作企业）」。"""
         cfg = _cfg()
         client = mock.Mock()
         client.get_instance.return_value = {"status": "PENDING", "form_items": [
@@ -363,13 +367,116 @@ class ProcessOneTests(unittest.TestCase):
                                     task=self._task("INST-NC"), cfg=cfg, dry_run=False)
             self.assertIsNone(err)
             self.assertTrue(rec["approved"])
-            self.assertEqual(rec["rating_text"], "企业名称为空,风险查询接口不适用")
+            self.assertEqual(rec["risk_level"], "exempt")
+            self.assertEqual(rec["rating_text"], "无须风险扫描（无合作企业）")
+            self.assertEqual(rec["cost"], 0)
             client.upload_approval_file.assert_not_called()
             client.approve_task.assert_called_once()
             self.assertEqual(client.approve_task.call_args.kwargs["comment"],
-                             "风险预审完成，自动放行")
+                             "风险预审完成：无合作企业，无须风险扫描，自动放行")
             form = client.approve_task.call_args.args[4]
             self.assertEqual([f["id"] for f in form], ["r1"])
+            self.assertEqual(form[0]["value"], "无须风险扫描（无合作企业）")
+            self.assertTrue(state.is_processed("INST-NC"))
+            self.assertEqual(state.get("INST-NC")["reason"], "approved_exempt")
+
+    def test_influencer_signing_without_company_exempt(self):
+        """达人签约且「是否涉及达人公司」=否:无达人企业名称控件(条件隐藏),同样免扫描放行;
+        表单里的达人真实姓名等自然人字段不参与判定。"""
+        cfg = _cfg()
+        client = mock.Mock()
+        client.get_instance.return_value = {"status": "PENDING", "form_items": [
+            {"id": "w1", "name": "合同类型", "type": "radioV2", "value": "达人签约"},
+            {"id": "w2", "name": "达人真实姓名", "type": "input", "value": "林山清"},
+            {"id": "w3", "name": "是否涉及达人公司", "type": "radioV2", "value": "否"},
+            {"id": "r1", "name": "企业风险评级", "type": "input", "value": ""},
+        ]}
+        with tempfile.TemporaryDirectory() as tmp:
+            state = StateStore(os.path.join(tmp, "state.json"))
+            rec, err = _process_one(client, store=object(), state=state,
+                                    task=self._task("INST-SIGN"), cfg=cfg, dry_run=False)
+            self.assertIsNone(err)
+            self.assertTrue(rec["approved"])
+            self.assertEqual(rec["risk_level"], "exempt")
+            self.assertEqual(rec["rating_text"], "无须风险扫描（无合作企业）")
+            client.approve_task.assert_called_once()
+            self.assertEqual(client.approve_task.call_args.kwargs["comment"],
+                             "风险预审完成：无合作企业，无须风险扫描，自动放行")
+
+    def test_exempt_rating_control_from_definition_fallback(self):
+        """实例表单无评级控件(条件显示)但定义表单有:经 fallback 定位并回填。"""
+        cfg = _cfg()
+        client = mock.Mock()
+        client.get_instance.return_value = {"status": "PENDING", "form_items": []}
+        client.get_approval_form.return_value = [
+            {"id": "r9", "name": "企业风险评级", "type": "input"},
+            {"id": "a9", "name": "风险报告附件（请勿上传文件，由法务AI智能体审批后上传）",
+             "type": "attachmentV2"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            state = StateStore(os.path.join(tmp, "state.json"))
+            rec, err = _process_one(client, store=object(), state=state,
+                                    task=self._task("INST-FB"), cfg=cfg, dry_run=False)
+            self.assertIsNone(err)
+            self.assertTrue(rec["approved"])
+            self.assertEqual(rec["rating_text"], "无须风险扫描（无合作企业）")
+            form = client.approve_task.call_args.args[4]
+            self.assertEqual([f["id"] for f in form], ["r9"])
+            self.assertEqual(form[0]["value"], "无须风险扫描（无合作企业）")
+
+    def test_exempt_without_rating_control_comment_only(self):
+        """实例与定义表单都无评级控件:仅评论放行,不回填任何字段。"""
+        cfg = _cfg()
+        client = mock.Mock()
+        client.get_instance.return_value = {"status": "PENDING", "form_items": []}
+        client.get_approval_form.return_value = []
+        with tempfile.TemporaryDirectory() as tmp:
+            state = StateStore(os.path.join(tmp, "state.json"))
+            rec, err = _process_one(client, store=object(), state=state,
+                                    task=self._task("INST-NR"), cfg=cfg, dry_run=False)
+            self.assertIsNone(err)
+            self.assertTrue(rec["approved"])
+            self.assertEqual(rec["rating_text"], "")
+            form = client.approve_task.call_args.args[4]
+            self.assertEqual(form, [])
+
+    def test_exempt_clears_mistaken_uploads(self):
+        """免扫描实例:申请人误传过文件则清空附件控件(独占口径一致)。
+
+        附件配置名用生产口径「风险报告附件」(模糊命中带说明后缀的控件名;
+        默认「附件」过短不做模糊,是有意防误中「合同附件」)。
+        """
+        cfg = _cfg()
+        cfg["field_attachment"] = "风险报告附件"
+        client = mock.Mock()
+        client.get_instance.return_value = {"status": "PENDING", "form_items": [
+            {"id": "r1", "name": "企业风险评级", "type": "input", "value": ""},
+            {"id": "a1", "name": "风险报告附件（请勿上传文件，由法务AI智能体审批后上传）",
+             "type": "attachmentV2", "value": ["https://old"]},
+        ]}
+        with tempfile.TemporaryDirectory() as tmp:
+            state = StateStore(os.path.join(tmp, "state.json"))
+            rec, err = _process_one(client, store=object(), state=state,
+                                    task=self._task("INST-EXC"), cfg=cfg, dry_run=False)
+            self.assertIsNone(err)
+            self.assertTrue(rec["approved"])
+            form = client.approve_task.call_args.args[4]
+            att = next(f for f in form if f["id"] == "a1")
+            self.assertEqual(att["value"], [])
+
+    def test_exempt_dry_run_does_not_approve_or_mark(self):
+        cfg = _cfg()
+        client = mock.Mock()
+        client.get_instance.return_value = {"status": "PENDING", "form_items": [
+            {"id": "r1", "name": "企业风险评级", "type": "input", "value": ""}]}
+        with tempfile.TemporaryDirectory() as tmp:
+            state = StateStore(os.path.join(tmp, "state.json"))
+            rec, err = _process_one(client, store=object(), state=state,
+                                    task=self._task("INST-EXD"), cfg=cfg, dry_run=True)
+            self.assertIsNone(err)
+            self.assertFalse(rec["approved"])
+            self.assertFalse(state.is_processed("INST-EXD"))
+            client.approve_task.assert_not_called()
 
     def test_dry_run_does_not_approve_or_mark(self):
         cfg = _cfg()

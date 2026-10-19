@@ -8,7 +8,19 @@
 报告写入「风险报告附件」专用控件,整体设值只保留报告,申请人误传文件一并删除;
 无报告场景若该控件被误传过文件则清空),并同意放行给法务。
 对方是自然人时(缓存未命中后查 dim_company 判定)不查企查查,回填
-「自然人无须评估风险」。
+「自然人无须评估风险」。实例表单无任何企业控件(如达人解约且不涉及达人公司,
+企业控件为条件显示)时免扫描直接放行:【企业风险评级】回填
+「无须风险扫描（无合作企业）」,实例与定义表单都定位不到评级控件时仅评论放行
+(2026-09-08 口径)。
+
+合同主体一致性校验(2026-10-19 口径,三次修正):企业实例先下载「合同附件」Word,
+解析签约抬头(甲/乙/丙多方,含表格内段落与修订插入;旧版 .doc 走 UTF-16LE 扫描),
+**统一按「签约主体」排除法**甄别对方——排除我方签约主体后:剩唯一公司主体→与表单
+企业控件归一化比对;仅剩自然人(合同对方是个人而表单填了企业)→形态不符直接拒绝;
+剩 0 或多个公司主体→无法唯一确定。比对不一致或形态不符均直接 tasks/reject 拒绝
+退回(先于缓存与企查查,零计费;reject 不支持 form 回填,原因写审批意见);仅附件
+缺失/解析失败(PDF、图片等)/无法唯一确定时放行并回填「合同主体未能自动校验，请
+法务人工核对」。FEISHU_SUBJECT_CHECK=0 可关闭回到旧行为。
 
 子命令:
   check                         体检飞书 + 企查查 + MySQL + 预审账号
@@ -40,6 +52,9 @@ if _SCRIPTS_DIR not in sys.path:
 from common.config import check_all, get_feishu  # noqa: E402
 from common import paths  # noqa: E402
 from common.company_store import store_from_env  # noqa: E402
+from common.contract_subject import (  # noqa: E402
+    ContractParseError, names_match, parse_contract_subjects, resolve_counterparty,
+)
 from common.snapshot import save as save_snapshot  # noqa: E402
 from common.state import StateStore  # noqa: E402
 from feishu.client import FeishuClient, extract_companies, find_control  # noqa: E402
@@ -56,6 +71,16 @@ _UNKNOWN_TEXT = "未知（未查得风险数据）"
 # 对方为自然人(dim_company 判定)时回填的固定文案,不查企查查、不附报告
 _NATURAL_PERSON_RATING = "自然人无须评估风险"
 _FALLBACK_RATING = "企业名称为空,风险查询接口不适用"
+# 实例表单无任何企业控件(如达人解约且不涉及达人公司):免扫描直接放行的回填文案
+# (2026-09-08 口径);定位不到评级控件时不回填,仅评论放行
+_EXEMPT_RATING = "无须风险扫描（无合作企业）"
+_EXEMPT_COMMENT = "风险预审完成：无合作企业，无须风险扫描，自动放行"
+# ---- 合同主体一致性校验(2026-10-19)----
+# 不一致直接拒绝退回(reject 不支持 form 回填,原因全写审批意见),零计费
+_SUBJECT_MISMATCH_RISK = "subject_mismatch"
+# 附件缺失/解析失败/无法唯一确定对方主体:放行交法务人工核对的回填文案
+_SUBJECT_SKIP_RATING = "合同主体未能自动校验，请法务人工核对"
+_SUBJECT_SKIP_COMMENT = "风险预审完成：合同主体未能自动校验，请法务人工核对，自动放行"
 _MYSQL_HINT = (
     "远程 MySQL 为必选:请在技能根目录复制 .env.example 为 .env,"
     "补齐 MYSQL_HOST / MYSQL_PORT / MYSQL_USER / MYSQL_PASSWORD / MYSQL_DB 后再用"
@@ -347,6 +372,173 @@ def _attachment_has_value(form_items, cfg):
     return any(isinstance(u, str) and u.strip() for u in (raw or []))
 
 
+def _attachment_urls(ctl):
+    """附件控件的下载直链列表(attachmentV2 的 value 为 URL 数组;兼容字符串 JSON)。"""
+    if not ctl:
+        return []
+    raw = ctl.get("value")
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return []
+        try:
+            raw = json.loads(text)
+        except (ValueError, TypeError):
+            raw = [text]
+    if not isinstance(raw, (list, tuple)):
+        raw = [raw]
+    out = []
+    for item in raw:
+        if isinstance(item, dict):
+            item = item.get("url") or item.get("id") or ""
+        if isinstance(item, str) and item.strip():
+            out.append(item.strip().replace("\\u0026", "&"))
+    return out
+
+
+def _control_text(ctl):
+    """控件单值文本(radioV2 固定选项的 value 为所选选项全称;list/dict 取首个标量)。"""
+    if not ctl:
+        return ""
+    value = ctl.get("value")
+    if isinstance(value, list):
+        value = value[0] if value else ""
+    if isinstance(value, dict):
+        for key in ("text", "value", "name"):
+            if value.get(key) not in (None, ""):
+                value = value[key]
+                break
+        else:
+            value = ""
+    return str(value or "").replace("\\u0026", "&").strip()
+
+
+def _check_contract_subject(client, form_items, fallback_items, cfg, company):
+    """校验合同 Word 里签约对方主体与表单企业控件一致(2026-10-19 口径)。
+
+    在查 MySQL 缓存/企查查之前执行:不一致由调用方拒绝退回,零计费。
+    返回 {status: match|mismatch|skip, contract_subject, our_entity, reason};
+    skip = 附件缺失/下载失败/解析失败/无法唯一确定对方 → 调用方放行+人工核对提醒。
+    """
+    result = {"status": "skip", "contract_subject": "", "our_entity": "", "reason": ""}
+    attach_ctl = _find_control_with_fallback(
+        form_items, cfg.get("field_contract_attach") or "合同附件", fallback_items,
+    )
+    urls = _attachment_urls(attach_ctl)
+    if not urls:
+        result["reason"] = "no_attachment"
+        return result
+    result["our_entity"] = _control_text(_find_control_with_fallback(
+        form_items, cfg.get("field_our_entity") or "签约主体", fallback_items,
+    ))
+    try:
+        blob = client.download(urls[0])
+    except Exception as e:
+        result["reason"] = "download_error:%s: %s" % (type(e).__name__, e)
+        return result
+    try:
+        subjects = parse_contract_subjects(blob)
+    except ContractParseError as e:
+        result["reason"] = "parse_error:%s" % e.code
+        return result
+    kind, subject = resolve_counterparty(
+        subjects, result["our_entity"], company.get("field") or "")
+    if kind == "unresolved":
+        result["reason"] = "unresolved_counterparty"
+        return result
+    result["contract_subject"] = subject
+    result["subject_kind"] = kind
+    if kind == "natural_person":
+        # 合同对方是自然人、表单企业控件填了企业 → 形态不符直接拒绝
+        # (2026-10-19 三次口径:此前误入「无法校验」兜底放行导致漏拒)
+        result["status"] = "mismatch"
+        result["reason"] = "counterparty_is_person"
+        return result
+    result["status"] = "match" if names_match(subject, company.get("name")) else "mismatch"
+    return result
+
+
+def _run_subject_check(client, store, form_items, fallback_items, cfg, companies):
+    """合同主体校验门:开关关/控件缺三要素→off;自然人→person(维持原放行口径)。
+
+    返回 (subject_check, error);error 仅在 dim_company 判定失败时非空
+    (与 fetch_or_cache_profile 同口径,不静默跳过)。
+    """
+    if not cfg.get("subject_check_enabled", True):
+        return {"status": "off"}, None
+    if not companies or companies[0].get("missing"):
+        return {"status": "off"}, None
+    company = companies[0]
+    try:
+        if store.is_natural_person(company["name"], company["credit_code"]):
+            return {"status": "person"}, None
+    except Exception as e:
+        return None, "dim_company 自然人判断失败: %s: %s" % (type(e).__name__, e)
+    return _check_contract_subject(client, form_items, fallback_items, cfg, company), None
+
+
+def _reject_subject_mismatch(client, state, task, cfg, dry_run, company, check):
+    """主体不一致:直接拒绝退回业务修改,不查企查查/不附报告(2026-10-19)。
+
+    reject 不支持 form 回填,原因全部写审批意见;飞书自动向发起人推拒绝通知;
+    拒绝后任务从待办消失(幂等)。
+    """
+    instance_code = task.get("instance_code") or ""
+    task_id = task.get("task_id") or ""
+    approval_code = task.get("approval_code") or ""
+    subject = check.get("contract_subject") or "?"
+    if check.get("subject_kind") == "natural_person":
+        subject = "「%s」（自然人）" % subject
+    else:
+        subject = "「%s」" % subject
+    comment = (
+        "风险预审拒绝：合同签约对方为%s，与表单%s「%s」不一致，"
+        "请核对修改后重新提交（未查询企业风险）"
+        % (subject, company.get("field") or "企业", company.get("name") or "")
+    )
+    rejected = False
+    if not dry_run:
+        try:
+            client.reject_task(
+                approval_code, instance_code, task_id,
+                cfg.get("approver_user_id") or "",
+                user_id_type=cfg.get("approver_user_id_type") or "open_id",
+                comment=comment,
+            )
+            rejected = True
+        except Exception as e:
+            return None, {"instance_code": instance_code,
+                          "error": "拒绝审批任务失败: %s: %s" % (type(e).__name__, e)}
+    rec = {
+        "instance_code": instance_code,
+        "task_id": task_id,
+        "approval_code": approval_code,
+        "field": company.get("field") or "",
+        "company": company.get("name") or "",
+        "credit_code": company.get("credit_code") or "",
+        "risk_level": _SUBJECT_MISMATCH_RISK,
+        "rating_text": "",
+        "source": "subject_check",
+        "cost": 0,
+        "report_file": "",
+        "file_code": "",
+        "approved": False,
+        "rejected": rejected,
+        "dry_run": dry_run,
+        "subject_check": {
+            "status": check.get("status"),
+            "contract_subject": check.get("contract_subject"),
+            "our_entity": check.get("our_entity"),
+        },
+    }
+    if not dry_run and rejected:
+        state.mark(instance_code, risk_level=_SUBJECT_MISMATCH_RISK,
+                   company=rec.get("company") or "", reason="rejected_subject_mismatch")
+    return rec, None
+
+
 def _companies_from_instance(detail, cfg):
     """按候选字段(如 对方单位名称/相对方企业名称/签约企业名称/达人公司名称)收集表单里已填的企业控件。"""
     return extract_companies(
@@ -425,12 +617,28 @@ def cmd_test_instance(instance_code):
     )
     located = {"rating": rating_ctl, "attachment": att_ctl}
 
+    subject_check, serr = _run_subject_check(
+        client, store, form_items, fallback_items, cfg, companies)
+    if serr:
+        _emit({"ok": False, "error": serr, "instance_code": instance_code})
+        return 1
+
     profile = None
     company = None
-    if not companies or companies[0].get("missing"):
+    exempt = not companies
+    if exempt:
+        # 实例表单无任何企业控件(如达人解约):免扫描直接放行,poll 将回填固定文案
+        rating_text = _EXEMPT_RATING
+    elif companies[0].get("missing"):
         rating_text = _FALLBACK_RATING
-        if companies and companies[0].get("missing"):
-            company = companies[0]
+        company = companies[0]
+    elif subject_check.get("status") == "mismatch":
+        # 干跑提示:正式 poll 将拒绝退回,不查企查查、不回填评级字段
+        company = companies[0]
+        rating_text = "主体不一致，将拒绝退回（不查企查查）"
+    elif subject_check.get("status") == "skip":
+        company = companies[0]
+        rating_text = _SUBJECT_SKIP_RATING
     else:
         company = companies[0]
         profile, err = fetch_or_cache_profile(
@@ -443,13 +651,18 @@ def cmd_test_instance(instance_code):
         rating_text = _rating_text(profile)
 
     # 干跑不上传附件,form 预览只含评级文本;附件展示其定位与「将写入 [file_code]」
-    form_preview, _ = _build_approve_form(
-        form_items, cfg, rating_text, file_code="", fallback_items=fallback_items,
-    )
+    if rating_ctl or not exempt:
+        form_preview, _ = _build_approve_form(
+            form_items, cfg, rating_text, file_code="", fallback_items=fallback_items,
+        )
+    else:
+        # 免扫描实例且实例/定义表单都无【企业风险评级】控件:放行时仅评论,不回填字段
+        form_preview = []
     _emit({
         "ok": True,
         "instance_code": instance_code,
         "status": detail.get("status"),
+        "exempt": exempt,
         "companies": [
             {"field": c.get("field"), "name": c.get("name"), "credit_code": c.get("credit_code")}
             for c in companies
@@ -457,6 +670,7 @@ def cmd_test_instance(instance_code):
         "company": company,
         "profile": profile,
         "rating_text": rating_text,
+        "subject_check": subject_check,
         "located_controls": {
             "rating": {k: rating_ctl.get(k) for k in ("id", "type", "name")} if rating_ctl else None,
             "attachment": {k: att_ctl.get(k) for k in ("id", "type", "name")} if att_ctl else None,
@@ -486,8 +700,106 @@ def _resolve_risk(store, companies, cfg, force):
     return profile, _rating_text(profile), "", None
 
 
+def _approve_task_with_retry(client, approval_code, instance_code, task_id, cfg, form, comment):
+    """同意审批任务;若 form 含空附件清空条目且被飞书拒绝,去掉该条目重试一次:
+    放行优先,清空降级为提醒。返回 (approved, attach_note, error)。"""
+    def _approve(f):
+        client.approve_task(
+            approval_code, instance_code, task_id,
+            cfg.get("approver_user_id") or "",
+            f, user_id_type=cfg.get("approver_user_id_type") or "open_id",
+            comment=comment,
+        )
+
+    try:
+        _approve(form)
+        return True, "", None
+    except Exception as e:
+        error = e
+        # 飞书若不接受空附件值,去掉清空条目重试一次:放行优先,清空降级为提醒
+        retry_form = [f for f in form
+                      if not (f.get("type") == "attachmentV2" and f.get("value") == [])]
+        if len(retry_form) != len(form):
+            try:
+                _approve(retry_form)
+                return True, "申请人误传文件未能清空(飞书拒绝空附件值),已放行,请人工删除", None
+            except Exception as e2:
+                error = e2
+        return False, "", error
+
+
+def _release_without_scan(client, state, task, cfg, dry_run, form_items, fallback_items):
+    """免扫描直接放行:实例表单无任何企业控件(如达人解约且不涉及达人公司),
+    不查企查查/不判自然人。【企业风险评级】回填固定文案;实例与定义表单都
+    定位不到评级控件时仅评论放行;申请人误传过文件则清空附件控件。"""
+    instance_code = task.get("instance_code") or ""
+    task_id = task.get("task_id") or ""
+    approval_code = task.get("approval_code") or ""
+    located = {}
+    form = []
+    rating_ctl = _find_control_with_fallback(
+        form_items, cfg.get("field_rating") or "企业风险评级", fallback_items,
+    )
+    if rating_ctl:
+        form.append({
+            "id": rating_ctl["id"],
+            "type": rating_ctl["type"] or "input",
+            "value": _EXEMPT_RATING,
+        })
+    if _attachment_has_value(form_items, cfg):
+        att_ctl = _find_control_with_fallback(
+            form_items, cfg.get("field_attachment") or "附件", fallback_items,
+        )
+        located["attachment"] = att_ctl
+        if att_ctl:
+            form.append({
+                "id": att_ctl["id"],
+                "type": att_ctl["type"] or "attachmentV2",
+                "value": [],
+            })
+        else:
+            located["attachment_warning"] = (
+                "表单未找到【附件】控件(配置名: %s),已跳过附件清空"
+                % (cfg.get("field_attachment") or "附件")
+            )
+    approved = False
+    attach_note = ""
+    if not dry_run:
+        approved, attach_note, error = _approve_task_with_retry(
+            client, approval_code, instance_code, task_id, cfg, form,
+            comment=_EXEMPT_COMMENT,
+        )
+        if not approved:
+            return None, {"instance_code": instance_code,
+                          "error": "同意审批任务失败: %s: %s" % (type(error).__name__, error)}
+    rec = {
+        "instance_code": instance_code,
+        "task_id": task_id,
+        "approval_code": approval_code,
+        "field": "",
+        "company": "",
+        "credit_code": "",
+        "risk_level": "exempt",
+        "rating_text": _EXEMPT_RATING if rating_ctl else "",
+        "source": "exempt",
+        "cost": 0,
+        "report_file": "",
+        "file_code": "",
+        "approved": approved,
+        "dry_run": dry_run,
+    }
+    if located.get("attachment_warning"):
+        rec["attachment_warning"] = located["attachment_warning"]
+    if attach_note:
+        rec["attachment_warning"] = attach_note
+    if not dry_run and approved:
+        state.mark(instance_code, risk_level="exempt", company="", reason="approved_exempt")
+    return rec, None
+
+
 def _process_one(client, store, state, task, cfg, dry_run, force=False):
     """处理单条预审任务:取风险→回填评级文本(低/中/高风险附 Excel 报告)→同意放行。
+    表单无任何企业控件(如达人解约)时走 _release_without_scan 免扫描直接放行。
 
     task: {task_id, approval_code, instance_code}。返回 (record_or_none, error_or_none)。
     两个回填控件只保留本技能写入的内容:评级控件始终覆写;附件控件低/中/高只放报告
@@ -510,10 +822,31 @@ def _process_one(client, store, state, task, cfg, dry_run, force=False):
             fallback_items = client.get_approval_form(approval_code)
         except Exception:
             fallback_items = []
-    profile, rating_text, file_code, err = _resolve_risk(store, companies, cfg, force)
-    if err:
-        return None, {"instance_code": instance_code, "error": err,
-                      "company": (companies[0] if companies else None)}
+    # 实例表单无任何企业控件(如达人解约且不涉及达人公司):免扫描直接放行(2026-09-08)
+    if not companies:
+        return _release_without_scan(
+            client, state, task, cfg, dry_run, form_items, fallback_items,
+        )
+    # 合同主体一致性校验(2026-10-19):先于缓存/企查查执行,不一致零计费直接拒绝退回;
+    # 附件缺失/解析失败/无法唯一确定对方→skip,放行并回填「请法务人工核对」
+    subject_check, serr = _run_subject_check(
+        client, store, form_items, fallback_items, cfg, companies)
+    if serr:
+        return None, {"instance_code": instance_code, "error": serr,
+                      "company": companies[0]}
+    if subject_check.get("status") == "mismatch":
+        return _reject_subject_mismatch(
+            client, state, task, cfg, dry_run, companies[0], subject_check)
+    if subject_check.get("status") == "skip":
+        # 不查企查查/不附报告,approve 放行交法务人工核对
+        profile = None
+        rating_text = _SUBJECT_SKIP_RATING
+        file_code = ""
+    else:
+        profile, rating_text, file_code, err = _resolve_risk(store, companies, cfg, force)
+        if err:
+            return None, {"instance_code": instance_code, "error": err,
+                          "company": (companies[0] if companies else None)}
 
     # 低/中/高风险都上传 Excel 报告,附件控件整体设值只保留报告(申请人误传文件一并删除);
     # 未知/自然人/兜底不附报告,但申请人若误传过文件则清空该控件
@@ -542,39 +875,19 @@ def _process_one(client, store, state, task, cfg, dry_run, force=False):
 
     approved = False
     if not dry_run:
-        label = _rating_label(profile)
-        comment = ("风险预审完成：%s，自动放行" % label) if label else "风险预审完成，自动放行"
-
-        def _approve(f):
-            client.approve_task(
-                approval_code, instance_code, task_id,
-                cfg.get("approver_user_id") or "",
-                f, user_id_type=cfg.get("approver_user_id_type") or "open_id",
-                comment=comment,
-            )
-
-        try:
-            _approve(form)
-            approved = True
-        except Exception as e:
-            error = e
-            if clear_attachment:
-                # 飞书若不接受空附件值,去掉清空条目重试一次:放行优先,清空降级为提醒
-                retry_form = [f for f in form
-                              if not (f.get("type") == "attachmentV2" and f.get("value") == [])]
-                if len(retry_form) != len(form):
-                    try:
-                        _approve(retry_form)
-                        approved = True
-                        attach_note = "申请人误传文件未能清空(飞书拒绝空附件值),已放行,请人工删除"
-                        error = None
-                    except Exception as e2:
-                        error = e2
-            if not approved:
-                return None, {"instance_code": instance_code,
-                              "error": "同意审批任务失败: %s: %s" % (type(error).__name__, error),
-                              "company": (companies[0] if companies else None),
-                              "risk_level": (profile or {}).get("risk_level")}
+        if subject_check.get("status") == "skip":
+            comment = _SUBJECT_SKIP_COMMENT
+        else:
+            label = _rating_label(profile)
+            comment = ("风险预审完成：%s，自动放行" % label) if label else "风险预审完成，自动放行"
+        approved, attach_note, error = _approve_task_with_retry(
+            client, approval_code, instance_code, task_id, cfg, form, comment,
+        )
+        if not approved:
+            return None, {"instance_code": instance_code,
+                          "error": "同意审批任务失败: %s: %s" % (type(error).__name__, error),
+                          "company": (companies[0] if companies else None),
+                          "risk_level": (profile or {}).get("risk_level")}
 
     rec = {
         "instance_code": instance_code,
@@ -591,6 +904,10 @@ def _process_one(client, store, state, task, cfg, dry_run, force=False):
         "file_code": file_code,
         "approved": approved,
         "dry_run": dry_run,
+        "subject_check": {
+            "status": subject_check.get("status"),
+            "contract_subject": subject_check.get("contract_subject", ""),
+        },
     }
     if located.get("attachment_warning"):
         rec["attachment_warning"] = located["attachment_warning"]
@@ -598,12 +915,18 @@ def _process_one(client, store, state, task, cfg, dry_run, force=False):
         rec["attachment_warning"] = attach_note
 
     if not dry_run and approved:
-        state.mark(
-            instance_code,
-            risk_level=(profile.get("risk_level") if profile else "unknown"),
-            company=rec.get("company") or "",
-            reason="approved",
-        )
+        if subject_check.get("status") == "skip":
+            state.mark(
+                instance_code, risk_level="subject_unverified",
+                company=rec.get("company") or "", reason="approved_subject_unverified",
+            )
+        else:
+            state.mark(
+                instance_code,
+                risk_level=(profile.get("risk_level") if profile else "unknown"),
+                company=rec.get("company") or "",
+                reason="approved",
+            )
     return rec, None
 
 
@@ -633,8 +956,17 @@ def cmd_process_instance(instance_code):
         _emit({"ok": False, "error": "该实例不在预审账号的待办任务中(可能已处理或不属于本账号)",
                "instance_code": instance_code})
         return 1
+    state = StateStore()
+    if state.is_processed(instance_code):
+        # 预审已完成(state 有记录):当前待办是后续人工审批节点,技能不代签
+        _emit({
+            "ok": True, "already_processed": True, "instance_code": instance_code,
+            "note": "该实例的系统风险预审已完成并记录在 state.json;"
+                    "当前待办为后续人工审批节点(预审账号在会签名单),请人工在飞书审批",
+        })
+        return 0
     rec, err = _process_one(
-        client, store, StateStore(), task, cfg, dry_run=False, force=("--force" in sys.argv[2:]),
+        client, store, state, task, cfg, dry_run=False, force=("--force" in sys.argv[2:]),
     )
     if err:
         _emit({"ok": False, **err})
@@ -682,9 +1014,16 @@ def cmd_poll(force=False):
             seen.add(ic)
             unique.append(t)
 
-    processed, errors = [], []
+    processed, errors, skipped_processed = [], [], []
     dry_run = bool(cfg.get("comment_dry_run"))
     for task in unique:
+        ic = task.get("instance_code")
+        # 预审已完成的实例:剩余待办属后续人工审批节点(预审账号可能在会签
+        # 名单里),技能不代签,跳过(2026-10-19:多节点流程下任务不会从待办
+        # 消失,单靠任务消失幂等会让技能误审批人工节点)
+        if ic and state.is_processed(ic):
+            skipped_processed.append(ic)
+            continue
         rec, err = _process_one(client, store, state, task, cfg, dry_run, force=force)
         if rec:
             processed.append(rec)
@@ -696,6 +1035,7 @@ def cmd_poll(force=False):
         "scanned": len(unique),
         "new": len(processed),
         "processed": processed,
+        "skipped_processed": skipped_processed,
         "errors": errors,
         "dry_run": dry_run,
         "approval_codes": cfg["approval_codes"],

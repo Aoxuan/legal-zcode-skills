@@ -97,6 +97,22 @@ def _attachment_field():
     return (os.getenv("FEISHU_FIELD_ATTACHMENT") or "附件").strip()
 
 
+def _field_contract_attach():
+    """合同 Word 附件控件名(或 widget id)。默认「合同附件」,
+    模糊命中「合同附件(请勿上传PDF、图片)」(与「风险报告附件」无子串冲突)。"""
+    return (os.getenv("FEISHU_FIELD_CONTRACT_ATTACH") or "合同附件").strip()
+
+
+def _field_our_entity():
+    """我方「签约主体」控件名(或 widget id),合同主体校验的排除法基准。默认「签约主体」。"""
+    return (os.getenv("FEISHU_FIELD_OUR_ENTITY") or "签约主体").strip()
+
+
+def _subject_check_enabled():
+    """合同主体一致性校验开关(2026-10-19):默认开;置 0/false 关闭回到旧行为。"""
+    return (os.getenv("FEISHU_SUBJECT_CHECK") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
 def _cache_days():
     """企业风险信息库缓存有效天数;超过则重查企查查。默认 90(近 3 个月)。"""
     raw = (os.getenv("FEISHU_CACHE_DAYS") or "90").strip()
@@ -125,6 +141,9 @@ def get_feishu():
         "approver_user_id_type": _approver_user_id_type(),
         "field_rating": _rating_field(),
         "field_attachment": _attachment_field(),
+        "field_contract_attach": _field_contract_attach(),
+        "field_our_entity": _field_our_entity(),
+        "subject_check_enabled": _subject_check_enabled(),
         "cache_days": _cache_days(),
     }
 
