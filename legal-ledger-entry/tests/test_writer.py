@@ -16,8 +16,12 @@ from ledger.widgets import (
     CATEGORY_TABLE,
     MAIN_TABLE,
     SUB_TABLE,
-    WIDGETS,
+    widgets_for,
 )
+
+# 表单 fixture 与 cfg 同源：都按 APPROVAL_CODE 解析控件 id，
+# 常量指向正式/副本任一环境时测试都成立（supplier/risk_attach 随环境切换）。
+W = widgets_for(APPROVAL_CODE)
 
 CFG = {
     "app_id": "cli_test",
@@ -42,12 +46,12 @@ def _docx(title):
 
 def _form(our, **extra):
     items = [
-        {"id": WIDGETS["our_entity"], "value": our},
-        {"id": WIDGETS["contract_attach"], "value": ["https://file.example/contract.docx"]},
-        {"id": WIDGETS["risk_attach"], "value": ["https://risk.example/skip.docx"]},
+        {"id": W["our_entity"], "value": our},
+        {"id": W["contract_attach"], "value": ["https://file.example/contract.docx"]},
+        {"id": W["risk_attach"], "value": ["https://risk.example/skip.docx"]},
     ]
     for key, value in extra.items():
-        items.append({"id": WIDGETS[key], "value": value})
+        items.append({"id": W[key], "value": value})
     return items
 
 

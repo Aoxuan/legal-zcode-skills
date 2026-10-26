@@ -4,13 +4,14 @@
 后台页面 id 7680902134576975065 只在审批后台 URL 里出现，不传任何 OpenAPI。
 """
 
-# 审批定义 code（合同审批副本）。API 用这个，不用后台页面 id。
-APPROVAL_CODE = "5D8E981F-1D5E-4C8E-9EA4-5E146B26F890"
+# 审批定义 code（正式「合同审批单」，2026-10-26 起交付默认；API 用这个，不用后台页面 id）。
+APPROVAL_CODE = "DB2F122F-9823-4D8E-9D01-7CFC068472FE"
 
-APP_TOKEN = "REDACTED_LEDGER_APP_TOKEN"
-MAIN_TABLE = "tblTkvIvviA93PYY"
-SUB_TABLE = "tblmEFt5GivFeTRU"
-CATEGORY_TABLE = "tblozjjQ8oKZ45Zi"
+# 正式合同台账坐标（2026-10-26 决策直接走正式；测试副本坐标见 .env.example 注释）。
+APP_TOKEN = "LmVHbDXpdaNTK1sTDbjceczrnkh"
+MAIN_TABLE = "tbln45WEECZDdHC3"
+SUB_TABLE = "tbl67Sg7imRboxAG"
+CATEGORY_TABLE = "tblFJBtFnuEr8xE0"
 
 # 控件 id 为权威。WIDGETS 默认是副本定义的 id。
 # 2026-10-26 并集比对（副本 28 张 / 正式 60 张表单）：12 个技能控件里只有

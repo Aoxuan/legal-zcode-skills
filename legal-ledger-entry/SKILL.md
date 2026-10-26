@@ -9,7 +9,7 @@ description: 法务手动给出合同审批单号后，读取该审批和合同 
 
 同一张审批只建一次行。已经建过的单号会直接返回已有记录，不会再占一个编号。驳回后的空号由法务在台账里人工作废，技能不回收。
 
-副本验收通过之前不要把 `.env` 里的台账 token 换成正式台账。
+2026-10-26 起经确认**直接使用正式审批定义 + 正式台账**（录错行由法务在台账人工修正）。`.env.example` 已预填正式坐标；要在测试副本环境验证时，按 `.env.example` 里的注释行改回副本坐标。
 
 本技能**不**轮询、**不**发飞书消息、**不**把 Word 转 PDF、**不**盖水印、**不**下载风险报告附件。同意审批只在用户确认审批意见之后进行，而且只同意绑定使用人自己的当前待办。
 
@@ -19,7 +19,7 @@ description: 法务手动给出合同审批单号后，读取该审批和合同 
 
 1. 探测：`py --version`。不是 3.11 就停下来，不要擅自安装系统软件。
 2. 把本文件夹放进平台 skills 目录（zcode / Cursor / Hermes 相同）。
-3. 复制 `.env.example` 为 `.env`，向用户索取并填写 `FEISHU_APP_ID` / `FEISHU_APP_SECRET`。审批 code 和台账副本坐标已经预填，缺了不要硬跑。不要把密钥写进对话或提交到 git。
+3. 复制 `.env.example` 为 `.env`，向用户索取并填写 `FEISHU_APP_ID` / `FEISHU_APP_SECRET`。正式审批 code 和正式台账坐标已经预填（2026-10-26 口径），缺了不要硬跑。不要把密钥写进对话或提交到 git。
 4. 安装依赖：`py -m pip install -r requirements.txt`（Windows 会一并装 pywin32，用于 `.doc` 自动转换）。外网不通时加 `-i http://docker-proxy.xgate.com/simple`。
 5. 绑定使用人：向用户要**手机号或个人邮箱**（只要一项）。然后执行 `py scripts/entry.py bind-user --mobile <手机号>` 或 `--email <邮箱>`。把返回的 `bound: true` 告诉用户即可。**交付包已预置放行白名单**（全体授权使用人，4 个 user_id）：每台机器首次绑定也只能绑白名单内用户，绑定其他人（含管理员账号）会被拒绝，需管理员执行 `bind-user --add` 显式新增。绑定、换绑、拒绝、放行都追加写 `data/bind_audit.jsonl`（手机号/邮箱只落掩码，user_id 与时间一并记录）。不要把手机号、邮箱写进对话以外的文件（审计日志里只允许掩码形态），不要提交 `.env`。查不到就提示检查 `contact:user.id:readonly` 已发版，且该账号在应用通讯录权限范围内。
 6. 自检：`py scripts/entry.py check`。`approver` 一项为已绑定后，放行才可用；未绑定时录入台账仍可用。
