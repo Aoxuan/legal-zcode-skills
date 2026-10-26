@@ -52,7 +52,7 @@ def test_biz_order_appends_project_without_talent():
 
 def test_project_never_alone_even_with_biz_order():
     """2026-10-26 生产案例回归：三个企业控件全空时，商单关联不得把
-    项目名称单独兜成相对方主体。"""
+    项目名称单独兜成相对方主体（相对方应为空串，由调用方停住）。"""
     form = [
         _w("biz_order", [{"instance_code": "SO-9"}]),
         _w("project", "平齿大鲨鱼"),
@@ -60,19 +60,32 @@ def test_project_never_alone_even_with_biz_order():
     assert extract_ledger_fields(form)["相对方主体（全称）"] == ""
 
 
-def test_fallback_base_used_when_form_base_empty():
+def test_widgets_for_switches_supplier_by_approval_code():
+    """切正式审批定义时 supplier/risk_attach 自动切换，其余控件不变。"""
+    from ledger.widgets import PROD_APPROVAL_CODE, WIDGETS, widgets_for
+
+    prod = widgets_for(PROD_APPROVAL_CODE)
+    assert prod["supplier"] == "widget17885056795820001"
+    assert prod["risk_attach"] == "widget17887789271910001"
+    assert prod["customer"] == WIDGETS["customer"]
+    assert widgets_for("")["supplier"] == WIDGETS["supplier"]
+    assert widgets_for("unknown-code")["supplier"] == WIDGETS["supplier"]
+
+
+def test_extract_reads_production_supplier_widget():
+    """正式表单（供应商控件是正式 id）+ 正式控件映射 → 正常取出基底。"""
+    from ledger.widgets import PROD_APPROVAL_CODE, widgets_for
+
+    prod_widgets = widgets_for(PROD_APPROVAL_CODE)
     form = [
-        _w("biz_order", [{"instance_code": "SO-9"}]),
-        _w("project", "平齿大鲨鱼"),
+        {"id": prod_widgets["supplier"], "value": "思搜网络（上海）有限公司｜91310104MA1FR3NP9J｜刘川球"},
+        {"id": prod_widgets["biz_order"], "value": [{"instance_code": "SO-9"}]},
+        {"id": prod_widgets["project"], "value": "平齿大鲨鱼"},
     ]
-    got = extract_ledger_fields(form, fallback_base="思搜网络（上海）有限公司")
+    got = extract_ledger_fields(form, widgets=prod_widgets)
     assert got["相对方主体（全称）"] == "思搜网络（上海）有限公司/平齿大鲨鱼"
-
-
-def test_fallback_base_ignored_when_form_base_present():
-    form = [_w("customer", "甲公司｜91ABC")]
-    got = extract_ledger_fields(form, fallback_base="乙公司")
-    assert got["相对方主体（全称）"] == "甲公司"
+    # 同一张正式表单用副本 id 去读 → 基底为空（触发停住的前提）
+    assert extract_ledger_fields(form)["相对方主体（全称）"] == ""
 
 
 def test_amount_and_summary():

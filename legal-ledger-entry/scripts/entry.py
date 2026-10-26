@@ -21,13 +21,12 @@ from common.config import approver_user_id, approver_whitelist, get_config, pres
 from common.envfile import upsert_env
 from common.state import StateStore
 from feishu.client import FeishuApiError, FeishuClient, parse_form
-from ledger.contract_party import party_from_docx
 from ledger.doc_convert import ensure_docx
 from ledger.docx_parse import parse_docx
 from ledger.errors import LedgerStop
 from ledger.form import extract_ledger_fields, find_attachment
 from ledger.release import comment_has_number, pending_tasks, preview, task_id_of
-from ledger.widgets import NO_FIELD, PARENT_LOOKUP_FIELD, SUB_NO_FIELD
+from ledger.widgets import NO_FIELD, PARENT_LOOKUP_FIELD, SUB_NO_FIELD, widgets_for
 from ledger.writer import (
     build_main_fields,
     build_sub_fields,
@@ -130,8 +129,24 @@ def run_entry(serial, dry_run=False, client=None, state=None, cfg=None):
     except Exception:
         raise LedgerStop("读取审批实例失败，已停住") from None
     form = parse_form(detail.get("form"))
-    ledger = extract_ledger_fields(form)
-    url = find_attachment(form)
+    widgets = widgets_for(cfg.get("approval_code"))
+    ledger = extract_ledger_fields(form, widgets)
+    if not (ledger.get("相对方主体（全称）") or "").strip():
+        # 2026-10-26 口径：不从合同兜底，如实反馈尝试过的控件后停住
+        tried = "、".join(
+            "%s(%s)" % (label, widgets[key])
+            for key, label in (
+                ("counterparty", "签约类型"),
+                ("customer", "客户名称"),
+                ("supplier", "供应商名称"),
+            )
+        )
+        raise LedgerStop(
+            "未从审批表单取到相对方主体：已依次尝试 %s，均无值或控件不存在"
+            "（若表单里实际填了企业，多半是控件 id 与该审批定义不一致）。"
+            "已停住，不建行、不占号，请人工核对" % tried
+        )
+    url = find_attachment(form, widgets)
     if not url:
         raise LedgerStop("审批单里没有合同附件，已停住")
 
@@ -143,17 +158,6 @@ def run_entry(serial, dry_run=False, client=None, state=None, cfg=None):
         raise LedgerStop("合同附件下载失败，已停住") from None
     blob = ensure_docx(blob)  # 旧版 .doc 在本机 Word 静默转临时 .docx；不可用时停住
     parsed = parse_docx(blob)
-    if not (ledger.get("相对方主体（全称）") or "").strip():
-        # 表单三个企业控件全空（2026-10-26 生产案例：正式定义供应商控件
-        # id 与副本不一致致读空，项目名称冒充相对方）→ 从合同 Word 兜底
-        _kind, party = party_from_docx(blob, ledger.get("签约主体") or "")
-        if party:
-            ledger = extract_ledger_fields(form, fallback_base=party)
-    if not (ledger.get("相对方主体（全称）") or "").strip():
-        raise LedgerStop(
-            "表单未取到相对方主体（签约类型/客户/供应商全空），合同 Word 里也"
-            "无法唯一甄别签约对方，已停住（不建行、不占号）"
-        )
     kind = parsed["kind"]
     for_sub = kind != "主合同"
     entity = map_our_entity(ledger.get("签约主体"), for_sub=for_sub)

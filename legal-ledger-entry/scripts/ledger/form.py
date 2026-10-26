@@ -40,18 +40,21 @@ def _company(raw):
     return text.split("｜")[0].split("|")[0].strip()
 
 
-def extract_ledger_fields(form, fallback_base=""):
-    """相对方组装与旧链路一致：
+def extract_ledger_fields(form, widgets=None):
+    """相对方只从审批表单取（2026-10-26 口径：不从合同兜底）：
 
-    基底 = 签约类型 / 客户 / 供应商，取先出现者，并剥掉信用代码；
-    三者全空时用 fallback_base（合同 Word 甄别出的签约对方）做基底——
-    项目名称绝不能单独充当相对方（2026-10-26 生产案例：正式定义控件
-    id 与副本不一致，三个企业控件全读空，商单关联把项目名称兜成了主体）；
-    达人真实姓名有值则追加，达人场景再追加达人企业名称；
-    已有基底或达人时，达人或商单非空再追加项目名称。用 / 拼接。
+    基底 = 签约类型 / 客户 / 供应商，取先出现者，并剥掉信用代码；三者全空
+    时相对方为空串，由调用方停住并如实反馈尝试过哪些控件（2026-10-26 生产
+    案例：正式定义供应商控件 id 与副本不一致致基底读空，项目名称冒充主体，
+    已堵死——项目名称只在已有基底或达人时追加，绝不单独充当相对方）。
+    达人真实姓名有值则追加，达人场景再追加达人企业名称。用 / 拼接。
+    widgets 默认用副本 id；切环境时由 entry 传 widgets_for(审批 code) 的结果。
     """
+    if widgets is None:
+        widgets = WIDGETS
+
     def text(key):
-        return _plain(_by_widget(form, WIDGETS[key]))
+        return _plain(_by_widget(form, widgets[key]))
 
     base = ""
     if text("counterparty"):
@@ -60,12 +63,10 @@ def extract_ledger_fields(form, fallback_base=""):
         base = _company(text("customer"))
     elif text("supplier"):
         base = _company(text("supplier"))
-    elif fallback_base:
-        base = fallback_base
 
     parts = []
     talent = text("talent_name")
-    biz_order_linked = bool(_by_widget(form, WIDGETS["biz_order"]))
+    biz_order_linked = bool(_by_widget(form, widgets["biz_order"]))
     if base:
         parts.append(base)
     if talent:
@@ -84,12 +85,14 @@ def extract_ledger_fields(form, fallback_base=""):
     }
 
 
-def find_attachment(form):
+def find_attachment(form, widgets=None):
     """只取合同附件 URL。不取风险报告附件。字面量 \\u0026 还原成 &。"""
+    if widgets is None:
+        widgets = WIDGETS
     for item in form or []:
         if not isinstance(item, dict):
             continue
-        if item.get("id") != WIDGETS["contract_attach"]:
+        if item.get("id") != widgets["contract_attach"]:
             continue
         value = item.get("value")
         urls = value if isinstance(value, list) else [value]

@@ -2,7 +2,7 @@
 # 安装与配置在 zcode / Cursor / Hermes 三端完全一致。
 
 name: legal-ledger-entry
-version: "1.3.1"
+version: "1.3.2"
 title: 合同审批单手动录入合同台账副本，确认后以使用人身份放行（.doc 自动转换 + 绑定白名单 + 审计）
 status: ga
 
