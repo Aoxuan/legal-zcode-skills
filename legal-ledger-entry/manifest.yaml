@@ -1,0 +1,78 @@
+# 技能清单（平台无关事实源）
+# 安装与配置在 zcode / Cursor / Hermes 三端完全一致。
+
+name: legal-ledger-entry
+version: "1.3.1"
+title: 合同审批单手动录入合同台账副本，确认后以使用人身份放行（.doc 自动转换 + 绑定白名单 + 审计）
+status: ga
+
+entry:
+  script: scripts/entry.py
+  commands:
+    check:
+      args: []
+      desc: 体检飞书令牌、审批 code、台账三表坐标、主表字段、映射文件、使用人是否已绑定
+    bind-user:
+      flags: ["--mobile", "--email", "--add"]
+      desc: 安装时用手机号或个人邮箱反查 user_id，写入 .env。首次绑定自动初始化放行白名单；之后换绑白名单外的人被拒绝，需 --add 显式新增。手机号和邮箱只在本地审计日志留掩码
+    entry:
+      args: [serial]
+      flags: ["--dry-run"]
+      desc: 按审批单号读取合同审批，把主合同或子合同写入台账副本。旧版 .doc 附件在本机用 Word 静默转临时 .docx 后解析（不动原件；无 Word/转换失败时停住提示重传）。使用人是当前待办审批人时返回待确认的审批意见，不直接放行。--dry-run 不写表、不放行
+    release:
+      args: [serial]
+      flags: ["--comment"]
+      desc: 用户确认审批意见后，用绑定的使用人身份同意其当前待办。意见里必须包含本次合同编号；绑定使用人须在本机放行白名单内
+
+inputs:
+  - name: serial
+    type: string
+    required: true
+    for: [entry, release]
+    desc: 审批单上的单号，如 202609090050。不是 instance_code
+  - name: comment
+    type: string
+    required: true
+    for: [release]
+    desc: 用户确认后的审批意见全文，必须包含本次合同编号
+
+outputs:
+  ok: bool
+  error: string
+  report: list
+  record_id: string
+  contract_no: string
+  table_id: string
+  kind: string
+  fields: object
+  release: string
+  release_reason: string
+  proposed_comment: string
+  task_id: string
+  node_name: string
+  released: bool
+
+depends:
+  - 飞书自建应用（FEISHU_APP_ID / FEISHU_APP_SECRET）：tenant_access_token
+  - 审批只读：approval:approval.list:readonly、approval:approval:readonly
+  - 同意待办：approval:task
+  - 反查使用人：contact:user.id:readonly
+  - 多维表格：bitable:app，且应用已被加为台账副本协作者
+  - .doc 自动转换：pywin32（仅 Windows）+ 本机安装 Word；非 Windows 或未装 Word 时 .doc 停住提示重传
+  - 审批定义 code：FEISHU_APPROVAL_CODE=5D8E981F-1D5E-4C8E-9EA4-5E146B26F890
+  - 台账副本：app_token REDACTED_LEDGER_APP_TOKEN；主表 tblTkvIvviA93PYY；子表 tblmEFt5GivFeTRU；分类表 tblozjjQ8oKZ45Zi
+  - 使用人：FEISHU_APPROVER_USER_ID（user_id），由 bind-user 写入
+  - 放行白名单：FEISHU_APPROVER_WHITELIST（逗号分隔 user_id），bind-user 维护；交付包预置全体 4 位授权使用人；空时回退当前绑定人
+  - 本地审计：data/bind_audit.jsonl 记绑定/换绑/新增白名单/放行（手机号与邮箱只落掩码）
+
+reuse:
+  - scripts/ledger/form.py  # 相对方组装口径沿用旧链路，不 import 01-poc
+  - scripts/ledger/entity_map.json
+
+packaging: |
+  运行时要求本机 Python 3.11（Windows 用 py，macOS 用 python3）。
+  安装 = 把本文件夹放入平台 skills 目录，pip install -r requirements.txt，
+  复制 .env.example 为 .env 并填写飞书凭证，再 bind-user 绑定使用人。
+  台账坐标已预填当前副本。不轮询。法务手动执行 entry。
+  同一 instance_code 只建一次行，记在 data/state.json。放行成功后同一状态记 released，不重复同意。
+  绑定与放行留审计痕迹（data/bind_audit.jsonl）；换绑白名单外用户必须 bind-user --add，由管理员执行。

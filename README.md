@@ -1,22 +1,24 @@
 # legal-zcode-skills
 
-法务部用的三个 zcode 技能，装在 zcode / Cursor / Hermes 的 skills 目录即可用。
+法务部用的四个 zcode 技能，装在 zcode / Cursor / Hermes 的 skills 目录即可用。
 
 | 技能目录 | 中文名 | 作用 |
 |---|---|---|
 | `legal-company-query/` | 企业风险查询 | 查一家公司的工商信息与风险等级，生成 Excel |
 | `legal-approval-risk/` | 合同审批风险预警 | 作为审批流「系统风险预审」节点审批人：轮询待办 → 查对方风险（自然人免查、90 天缓存优先）→ 回填【企业风险评级】并把 Excel 报告（命中风险整行黄色高亮）附到「风险报告附件」→ 自动放行给法务 |
 | `legal-person-poll/` | 自然人信息采集 | 定时扫描飞书「自然人信息录入申请」审批，把姓名/身份证号/电话/地址/对接人(含手机号)入库共库 MySQL 台账 `dim_company`，幂等不重复 |
+| `legal-ledger-entry/` | 合同台账录入 | 法务给审批单号，读审批与合同 Word 写入飞书合同台账（主/子合同自动分流、`.doc` 自动转换），确认审批意见后以绑定使用人身份放行并回填合同编号；相对方取不到时从合同甲方/乙方兜底（2026-10-26 口径） |
 
 ## 安装到 zcode
 
-1. 在 zcode「技能」页用本仓库地址安装（或把仓库克隆到 zcode 的 skills 目录）。应出现上面三个技能。
+1. 在 zcode「技能」页用本仓库地址安装（或把仓库克隆到 zcode 的 skills 目录）。应出现上面四个技能。
 2. 每个技能文件夹里把 `.env.example` 复制为 `.env` 并填写凭据。
 3. 每个技能目录装依赖：`py -m pip install -r requirements.txt`（macOS 用 `python3`）。
 4. 自检：
    - 企业风险查询：`py scripts/query.py check`
    - 合同审批风险预警：`py scripts/poll.py check`
    - 自然人信息采集：`py scripts/poll.py check`
+   - 合同台账录入：`py scripts/entry.py check`（绑定使用人 `py scripts/entry.py bind-user --mobile <手机号>`；用法见技能目录《使用说明-法务.md》）
 
 ## 交付文档（给法务和管理员）
 

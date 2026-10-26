@@ -1,0 +1,7 @@
+# legal-ledger-entry runtime deps (Python 3.11)
+# install: py -m pip install -r requirements.txt
+# 外网不通: py -m pip install -r requirements.txt -i http://docker-proxy.xgate.com/simple
+requests>=2.31.0
+python-dotenv>=1.0.0
+python-docx>=1.1.0
+pywin32>=306; sys_platform == "win32"
