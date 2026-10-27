@@ -574,6 +574,8 @@ def cmd_check():
         client.tenant_access_token()
         payload["feishu_token"] = True
         payload["approval_codes"] = cfg["approval_codes"]
+        if cfg.get("approval_codes_test"):
+            payload["approval_codes_test"] = cfg["approval_codes_test"]
     except Exception as e:
         payload["ok"] = False
         payload["feishu_token"] = False
@@ -975,7 +977,7 @@ def cmd_process_instance(instance_code):
     return 0
 
 
-def cmd_poll(force=False):
+def cmd_poll(force=False, use_test=False):
     ok, rep = check_all()
     if not ok:
         _emit({"ok": False, "error": _missing_creds_error(rep), "report": _json_report(rep)})
@@ -984,8 +986,15 @@ def cmd_poll(force=False):
     if store is None:
         return 1
     cfg = get_feishu()
-    if not cfg["approval_codes"]:
-        _emit({"ok": False, "error": "FEISHU_APPROVAL_CODES 为空,请填入合同审批定义 code"})
+    # --test 只扫测试流程码(FEISHU_APPROVAL_CODES_TEST),未配置直接报错,不回退正式码
+    if use_test:
+        codes_list = cfg.get("approval_codes_test") or []
+        codes_env = "FEISHU_APPROVAL_CODES_TEST"
+    else:
+        codes_list = cfg["approval_codes"]
+        codes_env = "FEISHU_APPROVAL_CODES"
+    if not codes_list:
+        _emit({"ok": False, "error": codes_env + " 为空,请填入合同审批定义 code"})
         return 1
     if not cfg.get("approver_user_id"):
         _emit({"ok": False, "error": _APPROVER_HINT})
@@ -1000,7 +1009,7 @@ def cmd_poll(force=False):
         _emit({"ok": False, "error": "查询预审账号待办失败: %s: %s" % (type(e).__name__, e)})
         return 1
     # 只处理我们关注的合同审批定义,且该任务支持 API 操作
-    codes = set(cfg["approval_codes"])
+    codes = set(codes_list)
     filtered = [
         t for t in tasks
         if t.get("approval_code") in codes and t.get("support_api_operate") is not False
@@ -1038,7 +1047,7 @@ def cmd_poll(force=False):
         "skipped_processed": skipped_processed,
         "errors": errors,
         "dry_run": dry_run,
-        "approval_codes": cfg["approval_codes"],
+        "approval_codes": codes_list,
         "approver_user_id": cfg.get("approver_user_id"),
     })
     return 0 if not errors else 1
@@ -1048,14 +1057,14 @@ def main(argv):
     if len(argv) < 2:
         _emit({
             "ok": False,
-            "error": "用法: poll.py check | poll [--force] | test-instance <instance_code> | process-instance <instance_code>",
+            "error": "用法: poll.py check | poll [--force] [--test] | test-instance <instance_code> | process-instance <instance_code>",
         })
         return 1
     sub = argv[1]
     if sub == "check":
         return cmd_check()
     if sub == "poll":
-        return cmd_poll(force="--force" in argv[2:])
+        return cmd_poll(force="--force" in argv[2:], use_test="--test" in argv[2:])
     if sub == "test-instance":
         if len(argv) < 3:
             _emit({"ok": False, "error": "test-instance 需要 <instance_code>"})

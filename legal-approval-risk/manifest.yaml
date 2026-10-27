@@ -2,8 +2,8 @@
 # 安装与配置在 zcode / Cursor / Hermes 三端完全一致,无平台专属步骤。
 
 name: legal-approval-risk
-version: "3.0.0"
-title: 合同审批风险预审(合同主体一致性校验+回填评级,不一致拒绝退回;低/中/高均附报告,自然人/无企业免查放行)
+version: "3.1.0"
+title: 合同审批风险预审(合同主体一致性校验+回填评级,不一致拒绝退回;低/中/高均附报告,自然人/无企业免查放行;默认扫正式流程,poll --test 扫测试流程)
 status: ga
 rules_version: legal-draft-2026-08-13
 
@@ -15,8 +15,8 @@ entry:
       args: []
       desc: 体检飞书 app 凭证 + 审批定义 + 企查查 + 远程 MySQL + 预审账号
     poll:
-      args: []
-      desc: 扫描预审账号待办任务,先做合同主体一致性校验(下载合同附件解析签约对方,统一按「签约主体」排除法;不一致 tasks/reject 拒绝退回零计费,无法核验放行提醒人工核对),一致才缓存优先取风险,回填评级(低/中/高均附 Excel 报告到「风险报告附件」控件)并同意放行(幂等,缓存未命中约 7.50 元/家;已预审实例的人工节点待办跳过不代签);实例表单无任何企业控件(如达人解约)免扫描直接放行,回填「无须风险扫描（无合作企业）」,0 元
+      args: ["--test(可选,只扫 FEISHU_APPROVAL_CODES_TEST 测试流程)"]
+      desc: 扫描预审账号待办任务,先做合同主体一致性校验(下载合同附件解析签约对方,统一按「签约主体」排除法;不一致 tasks/reject 拒绝退回零计费,无法核验放行提醒人工核对),一致才缓存优先取风险,回填评级(低/中/高均附 Excel 报告到「风险报告附件」控件)并同意放行(幂等,缓存未命中约 7.50 元/家;已预审实例的人工节点待办跳过不代签);实例表单无任何企业控件(如达人解约)免扫描直接放行,回填「无须风险扫描（无合作企业）」,0 元。默认只扫正式码 FEISHU_APPROVAL_CODES;--test 只扫测试码 FEISHU_APPROVAL_CODES_TEST(未配置直接报错,不回退正式码)
     test-instance:
       args: [instance_code]
       desc: 干跑单实例,解析三要素+定位回填控件+取风险,不 approve
@@ -52,7 +52,8 @@ outputs:
 
 depends:
   - 飞书自建应用(FEISHU_APP_ID / FEISHU_APP_SECRET):tenant_access_token;需审批读+同意任务(approval:task)权限
-  - 合同审批定义(FEISHU_APPROVAL_CODES):一个或多个 approval_code
+  - 合同审批定义(FEISHU_APPROVAL_CODES):一个或多个 approval_code(正式流程,普通 poll 只扫它)
+  - 测试流程码(FEISHU_APPROVAL_CODES_TEST,可选):仅 poll --test 扫描;未配置时 --test 直接报错,不回退正式码;两流程控件按名称定位,widget id 不同无影响
   - 审批定义须含「系统风险预审」节点(审批人=预审员工账号,法务节点之前),且【企业风险评级】非必填+可编辑、「附件」控件可编辑
   - 预审审批账号(FEISHU_APPROVER_USER_ID,open_id;未填回退 FEISHU_COMMENT_USER_ID)
   - 表单候选企业控件(FEISHU_FIELD_COMPANY,多个逗号分隔:客户名称,供应商名称,达人企业名称;三者互斥必现其一,三要素从命中的外部选项取出)

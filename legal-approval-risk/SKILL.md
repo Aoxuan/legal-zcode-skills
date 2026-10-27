@@ -20,7 +20,8 @@ description: 定时扫描预审员工账号在飞书合同审批里的待办任�
 2. 把本文件夹放入平台 skills 目录(zcode / Cursor / Hermes 相同)。
 3. 复制 `.env.example` 为 `.env`。**向用户索取**并写入下列凭据,缺则不要硬跑:
    - 飞书自建应用 `FEISHU_APP_ID` / `FEISHU_APP_SECRET`
-   - 合同审批定义 `FEISHU_APPROVAL_CODES`(多个用逗号分隔)
+   - 合同审批定义 `FEISHU_APPROVAL_CODES`(多个用逗号分隔;**默认/正式流程**,普通 poll 只扫它)
+   - 测试流程码 `FEISHU_APPROVAL_CODES_TEST`(可选,多个逗号分隔;仅 `poll --test` 扫它。2026-10-27 双流程口径:**默认走正式,只有用户指令里明确带「测试」字样才加 `--test`**;未配置时 `--test` 直接报错,不回退正式码。两流程控件按名称定位,widget id 不同无影响)
    - 表单候选企业控件 `FEISHU_FIELD_COMPANY`(多个逗号分隔:`客户名称,供应商名称,达人企业名称`,三者互斥、必现其一;三要素从命中的外部选项一并取出,不读「对方负责人」)
    - 回填控件 `FEISHU_FIELD_RATING`(默认 `企业风险评级`)、`FEISHU_FIELD_ATTACHMENT`(默认 `附件`)
    - 合同主体校验(默认开):`FEISHU_SUBJECT_CHECK`(0=关)、`FEISHU_FIELD_CONTRACT_ATTACH`(默认 `合同附件`)、`FEISHU_FIELD_OUR_ENTITY`(默认 `签约主体`)
@@ -76,12 +77,13 @@ py scripts/poll.py process-instance <instance_code> [--force]
 ### 一趟扫描(loop 每次触发跑这一条)
 
 ```
-py scripts/poll.py poll
+py scripts/poll.py poll [--test]
 ```
 
 输出 `{ok, scanned, new, processed, errors, dry_run, approval_codes, approver_user_id}`。
 
 - 扫描对象:预审账号在 `FEISHU_APPROVAL_CODES` 下的**待办任务**(`tasks/query`,`topic=1`),按 `instance_code` 去重
+- **双流程口径(2026-10-27)**:普通 `poll` 扫 `FEISHU_APPROVAL_CODES`(正式);`poll --test` 只扫 `FEISHU_APPROVAL_CODES_TEST`(测试),不回退正式码——**用户指令含「测试」字样才加 `--test`**,其余一律普通 poll
 - `processed`:本趟已 approve/reject 回填的实例,含 `field`/`risk_level`/`rating_text`/`source`/`cost`/`report_file`/`file_code`/`approved`/`rejected`/`subject_check`
 - **合同主体校验先行(2026-10-19)**:企业实例先下载合同 Word 比对签约对方主体——`mismatch` 直接 `tasks/reject` 拒绝退回(零计费,审批意见说明原因);`skip`(附件缺失/解析失败/无法唯一确定)不查企查查、回填「合同主体未能自动校验，请法务人工核对」放行;自然人/缺三要素/开关关闭不校验
 - 缓存优先:`FEISHU_CACHE_DAYS`(默认 90)内有记录则复用 MySQL,零成本;未命中先查 dim_company 判自然人(是→回填「自然人无须评估风险」,0 元),是企业才查企查查(约 7.50 元/家)并落库

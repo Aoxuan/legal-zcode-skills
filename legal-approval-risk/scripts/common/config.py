@@ -132,6 +132,8 @@ def get_feishu():
         "app_id": _require("FEISHU_APP_ID"),
         "app_secret": _require("FEISHU_APP_SECRET"),
         "approval_codes": [c.strip() for c in (_require("FEISHU_APPROVAL_CODES") or "").split(",") if c.strip()],
+        # 测试流程码(可选):仅 poll --test 时扫描,不配置则 --test 直接报错(不回退正式码)
+        "approval_codes_test": [c.strip() for c in (os.getenv("FEISHU_APPROVAL_CODES_TEST") or "").split(",") if c.strip()],
         "field_companies": _company_fields(),
         "query_window_days": int(os.getenv("FEISHU_QUERY_WINDOW_DAYS") or "30"),
         "comment_dry_run": (os.getenv("FEISHU_COMMENT_DRY_RUN") or "").lower() in ("1", "true", "yes"),
