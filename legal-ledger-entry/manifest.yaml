@@ -60,7 +60,7 @@ depends:
   - 多维表格：bitable:app，且应用已被加为台账副本协作者
   - .doc 自动转换：pywin32（仅 Windows）+ 本机安装 Word；非 Windows 或未装 Word 时 .doc 停住提示重传
   - 审批定义 code：FEISHU_APPROVAL_CODE=5D8E981F-1D5E-4C8E-9EA4-5E146B26F890
-  - 台账副本：app_token REDACTED_LEDGER_APP_TOKEN；主表 tblTkvIvviA93PYY；子表 tblmEFt5GivFeTRU；分类表 tblozjjQ8oKZ45Zi
+  - 台账副本：app_token 由发放方安全渠道提供(不入库)；主表 tblTkvIvviA93PYY；子表 tblmEFt5GivFeTRU；分类表 tblozjjQ8oKZ45Zi
   - 使用人：FEISHU_APPROVER_USER_ID（user_id），由 bind-user 写入
   - 放行白名单：FEISHU_APPROVER_WHITELIST（逗号分隔 user_id），bind-user 维护；交付包预置全体 4 位授权使用人；空时回退当前绑定人
   - 本地审计：data/bind_audit.jsonl 记绑定/换绑/新增白名单/放行（手机号与邮箱只落掩码）

@@ -45,7 +45,7 @@ description: 轮询飞书「自然人信息录入申请」审批流中**已审�
 
 - `FEISHU_APP_ID` / `FEISHU_APP_SECRET`:**每位用户填自己有权限的自建应用**凭证(开发者后台 → 凭证与基础信息)
 - `APPROVAL_CODE`:已预填「自然人信息录入申请」正式流程的审批定义 code(`F0A86650-…`)
-- `MYSQL_*`:**共库已预填**(`REDACTED_MYSQL_USER.dim_company`),密码由发放方通过**安全渠道单独发送**——勿写进文档/群聊/代码
+- `MYSQL_*`:**共库已预填**(`<MySQL 用户名>.dim_company`),密码由发放方通过**安全渠道单独发送**——勿写进文档/群聊/代码
 - `FIELD_*`:表单控件名映射,须与审批表单里的控件**标题逐字一致**(不确定先跑 `test-instance` 对照原始 form)
 - `WINDOW_DAYS`:扫描时间窗,默认 3
 
