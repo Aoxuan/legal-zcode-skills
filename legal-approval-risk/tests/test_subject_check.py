@@ -132,6 +132,56 @@ class ParseSubjectsTests(unittest.TestCase):
         self.assertEqual(parse_contract_subjects(blob),
                          {"party_a": _OUR2, "party_b": _SUPPLIER, "party_c": _STAGE_NAME})
 
+    def test_numbered_party_headings(self):
+        """2026-11-03 律师代理合同实测回放:「甲方1 ：/甲方2 ：」裸数字序号可命中,
+        序号侧并入同侧归集首见优先;我方(甲方2)靠排除法甄别而非首见。"""
+        blob = _docx_blob([
+            "民商事法律事务代理合同",
+            "甲方1 ：罗国浩",
+            "甲方2 ：%s" % _OUR2,
+            "甲方1、甲方2以下合称甲方或委托方。",
+            "乙方（受托方） ：四川发现律师事务所",
+        ])
+        self.assertEqual(parse_contract_subjects(blob),
+                         {"party_a": "罗国浩", "party_b": "四川发现律师事务所"})
+        kind, name = resolve_counterparty(
+            parse_contract_subjects(blob), _OUR2)
+        self.assertEqual((kind, name), ("company", "四川发现律师事务所"))
+
+    def test_paren_numbering_supported(self):
+        """括号序号「甲方（一）：」走括号限定组,原本即支持(防回归)。"""
+        blob = _docx_blob(["甲方（一）：%s" % _OUR, "甲方（二）：%s" % _OTHER,
+                           "乙方：%s" % _SUPPLIER])
+        self.assertEqual(parse_contract_subjects(blob),
+                         {"party_a": _OUR, "party_b": _SUPPLIER})
+
+    def test_numbering_not_false_positive(self):
+        """序号只认角色词与冒号之间的裸数字:值以数字开头不受影响;
+        角色词后接正文(「需方3名现场人员:」)不命中。"""
+        blob = _docx_blob(["甲方：%s" % _OUR,
+                           "乙方：2026年度推广合作协议(金额人民币100,000元)",
+                           "需方3名现场人员：%s" % _SUPPLIER])
+        subjects = parse_contract_subjects(blob)
+        self.assertEqual(subjects.get("party_a"), _OUR)
+        self.assertIn("2026年度推广合作协议", subjects.get("party_b", ""))
+        self.assertNotIn("party_c", subjects)
+
+    def test_payment_aliases_settlement(self):
+        """2026-11-03 结算单实测回放:「付款方/收款方」别名,排除法甄别对方。"""
+        blob = _docx_blob(["结算单", "付款方：%s" % _OUR2,
+                           "收款方：成都隐光象限摄影有限公司"])
+        self.assertEqual(parse_contract_subjects(blob),
+                         {"party_a": _OUR2, "party_b": "成都隐光象限摄影有限公司"})
+        kind, name = resolve_counterparty(
+            parse_contract_subjects(blob), _OUR2)
+        self.assertEqual((kind, name), ("company", "成都隐光象限摄影有限公司"))
+
+    def test_loan_aliases(self):
+        """借贷别名:出借方/贷款方(付侧)、借款方(收侧)。"""
+        blob = _docx_blob(["借款协议", "出借方：%s" % _OUR, "借款方：%s" % _OTHER])
+        self.assertEqual(parse_contract_subjects(blob),
+                         {"party_a": _OUR, "party_b": _OTHER})
+
     def test_paragraphs_inside_table(self):
         """签约方写在表格单元格里也要解析到(doc.paragraphs 不含表格,用 body 全量)。"""
         from docx import Document
